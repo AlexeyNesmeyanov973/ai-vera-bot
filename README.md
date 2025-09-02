@@ -26,3 +26,16 @@ Telegram-бот для транскрибации аудио и видео в т
 1. Установите зависимости:
 ```bash
 pip install -r requirements.txt
+### Служебные команды
+- `/backend` (админ): показать текущий бэкенд распознавания и модель.
+
+### Prometheus метрики
+- Эндпойнт: `GET /metrics` (на веб-сервисе).
+- Метрики:
+  - `web_requests_total{endpoint,method}`
+  - `webhook_errors_total{reason}`
+  - `webhook_latency_seconds` (гистограмма времени обработки).
+
+### Миграция PRO
+- При старте `worker` и `web` выполняется миграция `PRO_USER_IDS` (из env) в Redis/Postgres.
+- Идемпотентна. После успешной миграции можно очистить `PRO_USER_IDS` в окружении.
