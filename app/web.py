@@ -30,26 +30,21 @@ def metrics():
     data = generate_latest()
     return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
-@app.route("/webhook/paydmus", methods=["POST"])
+@app.route("/webhook/prodamus", methods=["POST"])
 @WEBHOOK_LATENCY.time()
-def webhook_paydmus():
+def webhook_prodamus():
     if not payment_manager:
         WEBHOOK_ERRORS_TOTAL.labels(reason="payments_disabled").inc()
         return jsonify({"error": "Payments disabled"}), 503
     try:
-        signature = request.headers.get('X-Paydmus-Signature')
-        payload = request.get_data()
+        raw = request.get_data()  # raw body (bytes)
+        headers = dict(request.headers)
 
-        if not signature:
-            WEBHOOK_ERRORS_TOTAL.labels(reason="no_signature").inc()
-            return jsonify({"error": "Missing signature"}), 401
-
-        if not payment_manager.verify_webhook_signature(payload, signature):
+        if not payment_manager.verify_webhook_signature(raw, headers):
             WEBHOOK_ERRORS_TOTAL.labels(reason="bad_signature").inc()
             return jsonify({"error": "Invalid signature"}), 401
 
         data = request.get_json(silent=True) or {}
-
         import asyncio
         result = asyncio.run(payment_manager.handle_webhook(data))
         if result.get("success"):

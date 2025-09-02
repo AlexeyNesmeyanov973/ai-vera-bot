@@ -15,17 +15,19 @@ Telegram-бот для транскрибации аудио и видео в т
 
 1. **Форкните репозиторий** и подключите к Render.com
 2. **Добавьте переменные окружения** в панели Render:
-   - `TELEGRAM_BOT_TOKEN` - токен от @BotFather
-   - `ADMIN_USER_IDS` - ID администраторов через запятую
-   - `PAYDUS_WEBHOOK_SECRET` - секрет из кабинета Paydmus
-3. **Настройте webhook** в Paydmus на: `https://your-app-name.onrender.com/webhook/paydmus`
-4. **Деплой** - Render автоматически соберет и запустит приложение
+   - `TELEGRAM_BOT_TOKEN` — токен от @BotFather
+   - `ADMIN_USER_IDS` — ID администраторов через запятую
+   - `PAYDMUS_WEBHOOK_SECRET` — секрет из кабинета Paydmus
+3. Настройте webhook в Prodamus на: 
+   `https://your-app-name.onrender.com/webhook/prodamus`
+4. **Деплой** — Render автоматически соберет и запустит приложение
 
 ## Локальная разработка
 
 1. Установите зависимости:
 ```bash
 pip install -r requirements.txt
+<<<<<<< HEAD
 ### Служебные команды
 - `/backend` (админ): показать текущий бэкенд распознавания и модель.
 
@@ -52,3 +54,5 @@ pip install -r requirements.txt
 ### Миграция PRO
 - При старте `worker` и `web` выполняется миграция `PRO_USER_IDS` (из env) в Redis/Postgres.
 - Идемпотентна. После успешной миграции можно очистить `PRO_USER_IDS` в окружении.
+=======
+>>>>>>> 5516b4c (добавлена платежная система)

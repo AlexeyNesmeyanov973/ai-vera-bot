@@ -5,32 +5,32 @@ services:
     dockerfilePath: Dockerfile
     dockerCommand: python -m app.bot
     envVars:
-      - key: PRO_USER_IDS
-        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: ADMIN_USER_IDS
         sync: false
       - key: PRO_USER_IDS
         sync: false
-      - key: PAYDMUS_WEBHOOK_SECRET
+      - key: PRODAMUS_WEBHOOK_SECRET
         sync: false
-      - key: PAYDMUS_PRO_AMOUNT
+      - key: PRODAMUS_PAYMENT_LINK
+        sync: false
+      - key: PRODAMUS_PRO_AMOUNT
         value: "299.0"
-        - key: WHISPER_BACKEND       # "openai" или "faster"
+      - key: WHISPER_BACKEND
         value: "faster"
-      - key: WHISPER_MODEL         # для openai: base/small/...; для faster: small/medium/large-v3 и т.п.
+      - key: WHISPER_MODEL
         value: "small"
-      - key: REDIS_URL             # опционально
+      - key: REDIS_URL
         sync: false
-      - key: DATABASE_URL          # опционально (postgres://... или postgresql://...)
+      - key: DATABASE_URL
         sync: false
 
   - type: web
     name: ai-vera-bot-web
     runtime: docker
     dockerfilePath: Dockerfile
-    dockerCommand: python -m app.web
+    dockerCommand: gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT app.web:app
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -38,7 +38,17 @@ services:
         sync: false
       - key: PRO_USER_IDS
         sync: false
-      - key: PAYDMUS_WEBHOOK_SECRET
+      - key: PRODAMUS_WEBHOOK_SECRET
         sync: false
-      - key: PAYDMUS_PRO_AMOUNT
+      - key: PRODAMUS_PAYMENT_LINK
+        sync: false
+      - key: PRODAMUS_PRO_AMOUNT
         value: "299.0"
+      - key: WHISPER_BACKEND
+        value: "faster"
+      - key: WHISPER_MODEL
+        value: "small"
+      - key: REDIS_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false

@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextType
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from app.config import TELEGRAM_BOT_TOKEN
 from app.limit_manager import limit_manager
 from app.task_queue import task_queue
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # ---------- Команды ----------
 
-async def start_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
@@ -36,11 +36,11 @@ async def start_command(update: Update, context: ContextType.DEFAULT_TYPE):
         "/backend — текущий бэкенд распознавания (админ)"
     )
 
-async def stats_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(limit_manager.get_usage_info(user_id))
 
-async def help_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Как использовать AI-Vera:*\n\n"
         "1) Голосовые — пришлите голос.\n"
@@ -51,7 +51,7 @@ async def help_command(update: Update, context: ContextType.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def premium_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if storage.is_pro(user_id):
         await update.message.reply_text(
@@ -73,7 +73,7 @@ async def premium_command(update: Update, context: ContextType.DEFAULT_TYPE):
         disable_web_page_preview=True
     )
 
-async def admin_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Только для администраторов.")
@@ -88,7 +88,7 @@ async def admin_command(update: Update, context: ContextType.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def add_pro_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def add_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Только для админов.")
@@ -103,7 +103,7 @@ async def add_pro_command(update: Update, context: ContextType.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Неверный формат user_id")
 
-async def remove_pro_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def remove_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Только для админов.")
@@ -118,7 +118,7 @@ async def remove_pro_command(update: Update, context: ContextType.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Неверный формат user_id")
 
-async def queue_stats_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def queue_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Только для админов.")
@@ -133,7 +133,7 @@ async def queue_stats_command(update: Update, context: ContextType.DEFAULT_TYPE)
     )
 
 # --- Новая команда: /backend (только для админов) ---
-async def backend_command(update: Update, context: ContextType.DEFAULT_TYPE):
+async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Только для администраторов.")
@@ -146,7 +146,7 @@ async def backend_command(update: Update, context: ContextType.DEFAULT_TYPE):
 
 # ---------- Обработка через очередь ----------
 
-async def process_via_queue(update: Update, context: ContextType.DEFAULT_TYPE, file_type: str, url: str | None = None):
+async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, file_type: str, url: str | None = None):
     queue_msg = await update.message.reply_text("📋 Задача поставлена в очередь...")
     try:
         task_id = await task_queue.add_task(task_manager.process_transcription_task, update, context, file_type, url)
@@ -172,8 +172,10 @@ async def process_via_queue(update: Update, context: ContextType.DEFAULT_TYPE, f
                     if result.get('pdf_path'):
                         try:
                             with open(result['pdf_path'], 'rb') as f:
-                                await update.message.reply_document(InputFile(f, filename="transcription.pdf"),
-                                                                   caption="📄 PDF версия транскрипции")
+                                await update.message.reply_document(
+                                    InputFile(f, filename="transcription.pdf"),
+                                    caption="📄 PDF версия транскрипции"
+                                )
                         except Exception as e:
                             logger.error(f"Ошибка отправки PDF: {e}")
 
@@ -205,19 +207,19 @@ async def process_via_queue(update: Update, context: ContextType.DEFAULT_TYPE, f
 
 # ---------- Хэндлеры ----------
 
-async def handle_voice(update: Update, context: ContextType.DEFAULT_TYPE):
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_via_queue(update, context, 'voice')
 
-async def handle_audio(update: Update, context: ContextType.DEFAULT_TYPE):
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_via_queue(update, context, 'audio')
 
-async def handle_video(update: Update, context: ContextType.DEFAULT_TYPE):
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_via_queue(update, context, 'video')
 
-async def handle_video_note(update: Update, context: ContextType.DEFAULT_TYPE):
+async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_via_queue(update, context, 'video_note')
 
-async def handle_document(update: Update, context: ContextType.DEFAULT_TYPE):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     name = (doc.file_name or "").lower()
     if any(name.endswith(ext) for ext in ('.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.avi', '.mov')):
@@ -225,7 +227,7 @@ async def handle_document(update: Update, context: ContextType.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Пожалуйста, отправьте аудио или видео файл.")
 
-async def handle_text(update: Update, context: ContextType.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text.startswith(('http://', 'https://', 'www.')):
         await process_via_queue(update, context, 'url', text)
@@ -259,6 +261,7 @@ def main():
 
     async def _post_init(_):
         await task_queue.start()
+
     async def _post_stop(_):
         await task_queue.stop()
 

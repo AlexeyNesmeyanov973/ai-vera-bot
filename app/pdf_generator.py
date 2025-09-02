@@ -2,6 +2,7 @@ import logging
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
+from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -42,11 +43,11 @@ class PDFGenerator:
             story.append(Spacer(1, 12))
 
             date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-            date_style = ParagraphStyle('DateStyle', parent=self.styles['Normal'], fontSize=10, textColor='#666666')
+            date_style = ParagraphStyle('DateStyle', parent=self.styles['Normal'], fontSize=10, textColor=colors.HexColor('#666666'))
             story.append(Paragraph(f"Сгенерировано: {date_str}", date_style))
             story.append(Spacer(1, 8))
 
-            signature_style = ParagraphStyle('SignatureStyle', parent=self.styles['Normal'], fontSize=9, textColor='#888888')
+            signature_style = ParagraphStyle('SignatureStyle', parent=self.styles['Normal'], fontSize=9, textColor=colors.HexColor('#888888'))
             story.append(Paragraph("Создано с помощью AI-Vera Transcribator", signature_style))
             story.append(Spacer(1, 15))
 
