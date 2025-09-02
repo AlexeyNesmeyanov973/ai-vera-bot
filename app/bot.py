@@ -1,7 +1,16 @@
 import logging
 import asyncio
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import os
+import uuid
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 from app.config import TELEGRAM_BOT_TOKEN
 from app.limit_manager import limit_manager
 from app.task_queue import task_queue
@@ -10,7 +19,8 @@ from app.utils import format_seconds
 from app import storage
 from app.config import WHISPER_BACKEND, WHISPER_MODEL, ADMIN_USER_IDS
 from app.bootstrap import run_startup_migrations
-from app.config import payment_manager  # оставляем для /premium
+from app.payments_bootstrap import payment_manager  # из нового файла
+from app.pdf_generator import pdf_generator
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -157,6 +167,14 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             if s == 'completed':
                 result = status.get('result', {})
                 if result.get('success'):
+                    # кэш последнего результата: для кнопок экспорта
+                    context.user_data['last_transcription'] = {
+                        'text': result.get('text', ''),
+                        'segments': result.get('segments') or [],
+                        'title': result.get('title') or 'Транскрибация',
+                        'pdf_path': result.get('pdf_path')
+                    }
+
                     head = ""
                     if result.get('title'):
                         head = f"✅ *{result['title']}*\nДлительность: {format_seconds(result['duration'])}\n\n"
@@ -169,6 +187,17 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     else:
                         await update.message.reply_text(head + f"📝 Результат:\n\n{text}", parse_mode='Markdown')
 
+                    # инлайн-кнопки экспорта
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("📄 PDF", callback_data="export:pdf"),
+                            InlineKeyboardButton("📝 TXT", callback_data="export:txt"),
+                        ],
+                        [InlineKeyboardButton("⏱️ SRT", callback_data="export:srt")]
+                    ])
+                    await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
+
+                    # Если авто-PDF был создан — отправим его
                     if result.get('pdf_path'):
                         try:
                             with open(result['pdf_path'], 'rb') as f:
@@ -205,6 +234,83 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         logger.error(f"Ошибка очереди: {e}")
         await queue_msg.edit_text("❌ Системная ошибка.")
 
+# ---------- Экспорт по кнопкам ----------
+
+def _ensure_downloads_dir() -> str:
+    d = "downloads"
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _srt_time(t: float) -> str:
+    ms = int(round((t - int(t)) * 1000))
+    s = int(t) % 60
+    m = (int(t) // 60) % 60
+    h = int(t) // 3600
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def _make_srt_content(segments: list[dict]) -> str:
+    lines = []
+    for idx, seg in enumerate(segments, 1):
+        start = float(seg.get('start', 0.0))
+        end = float(seg.get('end', 0.0))
+        text = (seg.get('text') or '').strip()
+        lines.append(str(idx))
+        lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    kind = (query.data or "").split(":", 1)[-1]
+    data = context.user_data.get('last_transcription')
+    if not data:
+        await query.edit_message_text("Нет недавнего результата для экспорта.")
+        return
+
+    title = data.get('title') or "transcription"
+    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+    downloads = _ensure_downloads_dir()
+    filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
+
+    try:
+        if kind == "pdf":
+            pdf_path = data.get('pdf_path')
+            if not pdf_path:
+                pdf_path = os.path.join(downloads, f"{filename_base}.pdf")
+                pdf_generator.generate_transcription_pdf(data['text'], pdf_path, title=title)
+            with open(pdf_path, "rb") as f:
+                await query.message.reply_document(InputFile(f, filename=os.path.basename(pdf_path)), caption="📄 PDF файл")
+            if not data.get('pdf_path') and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+
+        elif kind == "txt":
+            txt_path = os.path.join(downloads, f"{filename_base}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(data['text'])
+            with open(txt_path, "rb") as f:
+                await query.message.reply_document(InputFile(f, filename=os.path.basename(txt_path)), caption="📝 TXT файл")
+            os.remove(txt_path)
+
+        elif kind == "srt":
+            segments = data.get('segments') or []
+            if not segments:
+                await query.edit_message_text("⏱️ Нет сегментов для SRT.")
+                return
+            srt_path = os.path.join(downloads, f"{filename_base}.srt")
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(_make_srt_content(segments))
+            with open(srt_path, "rb") as f:
+                await query.message.reply_document(InputFile(f, filename=os.path.basename(srt_path)), caption="⏱️ SRT файл")
+            os.remove(srt_path)
+
+        else:
+            await query.edit_message_text("Неизвестный формат экспорта.")
+    except Exception:
+        logger.exception("Export error")
+        await query.edit_message_text("❌ Ошибка экспорта файла.")
+
 # ---------- Хэндлеры ----------
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,7 +343,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Точка входа ----------
 
 def main():
-    # Миграция PRO из ENV → Redis/Postgres
     run_startup_migrations()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -250,7 +355,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("addpro", add_pro_command))
     app.add_handler(CommandHandler("removepro", remove_pro_command))
-    app.add_handler(CommandHandler("backend", backend_command))   # <--- НОВОЕ
+    app.add_handler(CommandHandler("backend", backend_command))
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
@@ -258,6 +363,8 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:"))
 
     async def _post_init(_):
         await task_queue.start()

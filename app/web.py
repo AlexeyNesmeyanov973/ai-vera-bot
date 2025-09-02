@@ -1,7 +1,7 @@
 import os
 import logging
 from flask import Flask, request, jsonify, Response
-from app.config import payment_manager
+from app.payments_bootstrap import payment_manager
 from app.bootstrap import run_startup_migrations
 
 # Prometheus
@@ -52,7 +52,7 @@ def webhook_prodamus():
         else:
             WEBHOOK_ERRORS_TOTAL.labels(reason="handler_error").inc()
             return jsonify(result), 400
-    except Exception as e:
+    except Exception:
         logger.exception("Webhook error")
         WEBHOOK_ERRORS_TOTAL.labels(reason="exception").inc()
         return jsonify({"error": "Internal error"}), 500

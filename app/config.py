@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-from app.payment_manager import PaymentManager
 
 load_dotenv()
 
@@ -27,13 +26,3 @@ PRODAMUS_PAYMENT_LINK = os.getenv('PRODAMUS_PAYMENT_LINK', '').strip()
 # Хранилища
 REDIS_URL = os.getenv('REDIS_URL', '')
 DATABASE_URL = os.getenv('DATABASE_URL', '')
-
-payment_manager = None
-if PRODAMUS_WEBHOOK_SECRET:
-    payment_manager = PaymentManager(
-        webhook_secret=PRODAMUS_WEBHOOK_SECRET,
-        payment_link_base=PRODAMUS_PAYMENT_LINK or None,
-        default_amount=PRODAMUS_PRO_AMOUNT
-    )
-else:
-    print("⚠️  PRODAMUS_WEBHOOK_SECRET не установлен. Платежи отключены.")
