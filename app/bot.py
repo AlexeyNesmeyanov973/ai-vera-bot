@@ -2,11 +2,15 @@ import logging
 import asyncio
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextType
-from app.config import TELEGRAM_BOT_TOKEN, ADMIN_USER_IDS, payment_manager, PRO_USER_IDS
+from app.config import TELEGRAM_BOT_TOKEN
 from app.limit_manager import limit_manager
 from app.task_queue import task_queue
 from app.task_manager import task_manager
 from app.utils import format_seconds
+from app import storage
+from app.config import WHISPER_BACKEND, WHISPER_MODEL, ADMIN_USER_IDS
+from app.bootstrap import run_startup_migrations
+from app.config import payment_manager  # оставляем для /premium
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -28,7 +32,8 @@ async def start_command(update: Update, context: ContextType.DEFAULT_TYPE):
         "/help — помощь\n"
         "/queue — статус очереди (админ)\n"
         "/premium — PRO-статус\n"
-        "/admin — админ-панель"
+        "/admin — админ-панель\n"
+        "/backend — текущий бэкенд распознавания (админ)"
     )
 
 async def stats_command(update: Update, context: ContextType.DEFAULT_TYPE):
@@ -48,7 +53,7 @@ async def help_command(update: Update, context: ContextType.DEFAULT_TYPE):
 
 async def premium_command(update: Update, context: ContextType.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in PRO_USER_IDS:
+    if storage.is_pro(user_id):
         await update.message.reply_text(
             "🎉 У вас уже есть PRO:\n• 120 мин/день\n• Приоритетная обработка\n• Все форматы"
         )
@@ -74,9 +79,10 @@ async def admin_command(update: Update, context: ContextType.DEFAULT_TYPE):
         await update.message.reply_text("❌ Только для администраторов.")
         return
     stats = task_queue.get_queue_stats()
+    pro_users_count = storage.count_pro()
     await update.message.reply_text(
         "👑 *Админ-панель*\n\n"
-        f"PRO пользователей: {len(PRO_USER_IDS)}\n"
+        f"PRO пользователей: {pro_users_count}\n"
         f"Задач в очереди: {stats['queue_size']}\n"
         f"Активных задач: {stats['active_tasks']}\n",
         parse_mode='Markdown'
@@ -92,8 +98,7 @@ async def add_pro_command(update: Update, context: ContextType.DEFAULT_TYPE):
         return
     try:
         target = int(context.args[0])
-        if target not in PRO_USER_IDS:
-            PRO_USER_IDS.append(target)
+        storage.add_pro(target)
         await update.message.reply_text(f"✅ Пользователь {target} добавлен в PRO")
     except ValueError:
         await update.message.reply_text("Неверный формат user_id")
@@ -108,8 +113,7 @@ async def remove_pro_command(update: Update, context: ContextType.DEFAULT_TYPE):
         return
     try:
         target = int(context.args[0])
-        if target in PRO_USER_IDS:
-            PRO_USER_IDS.remove(target)
+        storage.remove_pro(target)
         await update.message.reply_text(f"✅ Пользователь {target} удалён из PRO")
     except ValueError:
         await update.message.reply_text("Неверный формат user_id")
@@ -126,6 +130,18 @@ async def queue_stats_command(update: Update, context: ContextType.DEFAULT_TYPE)
         f"• Активных: {stats['active_tasks']}\n"
         f"• Всего: {stats['total_tasks']}\n"
         f"• Параллельно: {stats['max_concurrent']}\n"
+    )
+
+# --- Новая команда: /backend (только для админов) ---
+async def backend_command(update: Update, context: ContextType.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Только для администраторов.")
+        return
+    await update.message.reply_text(
+        "⚙️ Текущие настройки распознавания:\n"
+        f"• Бэкенд: {WHISPER_BACKEND}\n"
+        f"• Модель: {WHISPER_MODEL}"
     )
 
 # ---------- Обработка через очередь ----------
@@ -219,6 +235,9 @@ async def handle_text(update: Update, context: ContextType.DEFAULT_TYPE):
 # ---------- Точка входа ----------
 
 def main():
+    # Миграция PRO из ENV → Redis/Postgres
+    run_startup_migrations()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
@@ -229,6 +248,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("addpro", add_pro_command))
     app.add_handler(CommandHandler("removepro", remove_pro_command))
+    app.add_handler(CommandHandler("backend", backend_command))   # <--- НОВОЕ
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))

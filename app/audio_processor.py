@@ -1,68 +1,78 @@
-import os
 import logging
-import whisper
-from app.config import WHISPER_MODEL
+from app.config import WHISPER_BACKEND, WHISPER_MODEL
 
 logger = logging.getLogger(__name__)
 
 class AudioProcessor:
-    """Класс для транскрибации аудио с помощью Whisper."""
-    
+    """
+    Унифицированный интерфейс распознавания:
+    - WHISPER_BACKEND = "openai"  -> openai-whisper
+    - WHISPER_BACKEND = "faster"  -> faster-whisper
+    """
     def __init__(self):
-        self.model = None
+        self.backend = WHISPER_BACKEND
         self.model_name = WHISPER_MODEL
-    
+        self._model = None
+
+    def _load_openai_whisper(self):
+        import whisper
+        logger.info(f"Загрузка openai-whisper: {self.model_name}")
+        return whisper.load_model(self.model_name)
+
+    def _load_faster_whisper(self):
+        from faster_whisper import WhisperModel
+        # compute_type="int8" ускорит на CPU; можно выбрать "int8"|"float16"|"float32"
+        logger.info(f"Загрузка faster-whisper: {self.model_name}")
+        return WhisperModel(self.model_name, device="cpu", compute_type="int8")
+
     def load_model(self):
-        """Загружает модель Whisper."""
-        if self.model is None:
-            logger.info(f"Загрузка модели Whisper: {self.model_name}")
-            self.model = whisper.load_model(self.model_name)
-            logger.info("Модель Whisper успешно загружена")
-    
+        if self._model is not None:
+            return
+        if self.backend == "openai":
+            self._model = self._load_openai_whisper()
+        else:
+            self._model = self._load_faster_whisper()
+
     def transcribe_audio(self, audio_path: str) -> dict:
-        """
-        Транскрибирует аудиофайл с помощью Whisper.
-        
-        Args:
-            audio_path: Путь к аудиофайлу.
-            
-        Returns:
-            dict: Результат транскрибации.
-        """
-        try:
-            self.load_model()
-            result = self.model.transcribe(audio_path, language='ru', verbose=False)
-            return result
-        except Exception as e:
-            logger.error(f"Ошибка транскрибации: {e}")
-            raise
-    
+        self.load_model()
+        if self.backend == "openai":
+            # Совместимый формат ответа
+            try:
+                result = self._model.transcribe(audio_path, language='ru', verbose=False)
+                return result
+            except Exception as e:
+                logger.error(f"Ошибка openai-whisper: {e}")
+                raise
+        else:
+            # faster-whisper -> приведём к совместимому формату
+            try:
+                segments, info = self._model.transcribe(audio_path, language="ru")
+                text = []
+                seg_list = []
+                for seg in segments:
+                    seg_list.append({
+                        "id": seg.id,
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": seg.text.strip()
+                    })
+                    text.append(seg.text)
+                return {"text": "".join(text).strip(), "segments": seg_list, "language": info.language}
+            except Exception as e:
+                logger.error(f"Ошибка faster-whisper: {e}")
+                raise
+
     def format_transcription(self, result: dict, with_timestamps: bool = False) -> str:
-        """
-        Форматирует результат транскрибации в текст.
-        
-        Args:
-            result: Результат от Whisper.
-            with_timestamps: Добавлять ли временные метки.
-            
-        Returns:
-            str: Отформатированный текст.
-        """
         if not result or 'text' not in result:
             return "Не удалось распознать текст."
-        
         if not with_timestamps:
             return result['text'].strip()
-        
-        # Форматирование с таймстепми
-        formatted_text = ""
-        for segment in result.get('segments', []):
-            start = segment['start']
-            end = segment['end']
-            text = segment['text'].strip()
-            formatted_text += f"[{start:.0f}s-{end:.0f}s] {text}\n"
-        
-        return formatted_text.strip()
+        out = []
+        for seg in result.get('segments', []) or []:
+            start = seg.get('start', 0)
+            end = seg.get('end', 0)
+            text = seg.get('text', '').strip()
+            out.append(f"[{start:.0f}s-{end:.0f}s] {text}")
+        return "\n".join(out).strip()
 
-# Глобальный экземпляр процессора
 audio_processor = AudioProcessor()

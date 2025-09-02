@@ -15,11 +15,17 @@ MAX_FILE_SIZE_MB = 20
 ADMIN_USER_IDS = list(map(int, os.getenv('ADMIN_USER_IDS', '').split(','))) if os.getenv('ADMIN_USER_IDS') else []
 PRO_USER_IDS = list(map(int, os.getenv('PRO_USER_IDS', '').split(','))) if os.getenv('PRO_USER_IDS') else []
 
-WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'base')
+# Бэкенд распознавания: "openai" | "faster"
+WHISPER_BACKEND = os.getenv('WHISPER_BACKEND', 'faster').lower()
+WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'small')
 
-# Единый префикс PAYDMUS_*
+# Paydmus
 PAYDMUS_WEBHOOK_SECRET = os.getenv('PAYDMUS_WEBHOOK_SECRET', '')
 PAYDMUS_PRO_AMOUNT = float(os.getenv('PAYDMUS_PRO_AMOUNT', '299.0'))
+
+# Хранилища
+REDIS_URL = os.getenv('REDIS_URL', '')
+DATABASE_URL = os.getenv('DATABASE_URL', '')
 
 payment_manager = None
 if PAYDMUS_WEBHOOK_SECRET:
