@@ -19,16 +19,21 @@ PRO_USER_IDS = list(map(int, os.getenv('PRO_USER_IDS', '').split(','))) if os.ge
 WHISPER_BACKEND = os.getenv('WHISPER_BACKEND', 'faster').lower()
 WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'small')
 
-# Paydmus
-PAYDMUS_WEBHOOK_SECRET = os.getenv('PAYDMUS_WEBHOOK_SECRET', '')
-PAYDMUS_PRO_AMOUNT = float(os.getenv('PAYDMUS_PRO_AMOUNT', '299.0'))
+# Prodamus
+PRODAMUS_WEBHOOK_SECRET = os.getenv('PRODAMUS_WEBHOOK_SECRET', '')
+PRODAMUS_PRO_AMOUNT = float(os.getenv('PRODAMUS_PRO_AMOUNT', '299.0'))
+PRODAMUS_PAYMENT_LINK = os.getenv('PRODAMUS_PAYMENT_LINK', '').strip()
 
 # Хранилища
 REDIS_URL = os.getenv('REDIS_URL', '')
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 
 payment_manager = None
-if PAYDMUS_WEBHOOK_SECRET:
-    payment_manager = PaymentManager(PAYDMUS_WEBHOOK_SECRET)
+if PRODAMUS_WEBHOOK_SECRET:
+    payment_manager = PaymentManager(
+        webhook_secret=PRODAMUS_WEBHOOK_SECRET,
+        payment_link_base=PRODAMUS_PAYMENT_LINK or None,
+        default_amount=PRODAMUS_PRO_AMOUNT
+    )
 else:
-    print("⚠️  PAYDMUS_WEBHOOK_SECRET не установлен. Платежи отключены.")
+    print("⚠️  PRODAMUS_WEBHOOK_SECRET не установлен. Платежи отключены.")
