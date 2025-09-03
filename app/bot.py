@@ -42,6 +42,8 @@ from app.payments_bootstrap import payment_manager
 from app.pdf_generator import pdf_generator
 from app.translator import translate_text
 from app.analytics import analyze_text, build_report_md
+from app.docx_generator import docx_generator
+
 
 
 
@@ -425,6 +427,10 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                 InlineKeyboardButton("⏱️ SRT", callback_data="export:srt"),
                                 InlineKeyboardButton("🗣️ TXT (спикеры)", callback_data="export:txt_spk"),
                             ],
+                            [
+                                InlineKeyboardButton("📘 DOCX", callback_data="export:docx"),
+                                InlineKeyboardButton("📘 DOCX (спикеры)", callback_data="export:docx_spk"),
+                            ],
                         ]
                     )
                     await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
@@ -607,6 +613,49 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption="🗣️ TXT со спикерами",
             )
         os.remove(spk_path)
+
+                elif kind == "docx":
+            docx_path = os.path.join(downloads, f"{filename_base}.docx")
+            ok = docx_generator.generate_plain_docx(data["text"], docx_path, title=title)
+            if not ok:
+                await query.edit_message_text("❌ Ошибка генерации DOCX.")
+                return
+            with open(docx_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(docx_path)),
+                    caption="📘 DOCX файл",
+                )
+            os.remove(docx_path)
+
+        elif kind == "docx_spk":
+            segments = data.get("segments") or []
+            if not segments or not any(s.get("speaker") for s in segments):
+                # спикеров нет — отправим обычный DOCX
+                docx_path = os.path.join(downloads, f"{filename_base}.docx")
+                ok = docx_generator.generate_plain_docx(data["text"], docx_path, title=title)
+                if not ok:
+                    await query.edit_message_text("❌ Ошибка генерации DOCX.")
+                    return
+                with open(docx_path, "rb") as f:
+                    await query.message.reply_document(
+                        InputFile(f, filename=os.path.basename(docx_path)),
+                        caption="📘 DOCX файл",
+                    )
+                os.remove(docx_path)
+                return
+
+            spk_docx_path = os.path.join(downloads, f"{filename_base}_speakers.docx")
+            ok = docx_generator.generate_speaker_docx(segments, spk_docx_path, title=title, with_timestamps=True)
+            if not ok:
+                await query.edit_message_text("❌ Ошибка генерации DOCX со спикерами.")
+                return
+            with open(spk_docx_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(spk_docx_path)),
+                    caption="📘 DOCX со спикерами",
+                )
+            os.remove(spk_docx_path)
+ 
 
         else:
             await query.edit_message_text("Неизвестный формат экспорта.")
