@@ -87,7 +87,6 @@ def _lang_pretty(code: str | None) -> str:
 # Подстраховка, если инстанс не экспортирован (ImportError)
 try:
     from app.limit_manager import limit_manager
-
 except ImportError:
     from app.limit_manager import LimitManager
     limit_manager = LimitManager()
