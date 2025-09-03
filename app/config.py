@@ -27,7 +27,7 @@ WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru")     # "ru" или "auto"
 FREE_USER_DAILY_LIMIT_MINUTES = int(os.getenv("FREE_USER_DAILY_LIMIT_MINUTES", "30"))
 PRO_USER_DAILY_LIMIT_MINUTES = int(os.getenv("PRO_USER_DAILY_LIMIT_MINUTES", "180"))
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "20"))          # лимит для файлов, присланных в Telegram
-URL_MAX_FILE_SIZE_MB = int(os.getenv("URL_MAX_FILE_SIZE_MB", "500")) # лимит для файлов, скачанных по ссылке
+URL_MAX_FILE_SIZE_MB = int(os.getenv("URL_MAX_FILE_SIZE_MB", "2000")) # лимит для файлов, скачанных по ссылке
 
 # === Сверх лимита (докупка) ===
 OVERAGE_PRICE_RUB = float(os.getenv("OVERAGE_PRICE_RUB", "2.0"))
