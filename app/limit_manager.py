@@ -1,3 +1,4 @@
+# app/limit_manager.py
 from datetime import date
 from app.config import FREE_USER_DAILY_LIMIT_MINUTES, PRO_USER_DAILY_LIMIT_MINUTES
 from app import storage
@@ -16,7 +17,7 @@ class LimitManager:
         today = date.today()
         if last_date != today:
             storage.set_usage(user_id, 0, today)
-        # overage сбрасывается отдельной логикой в storage.add_overage_seconds / get_overage
+        # overage хранится со своей датой в storage; сброс делается там
 
     def can_process(self, user_id: int, audio_duration_seconds: int) -> tuple[bool, str, int, int]:
         """
@@ -50,10 +51,8 @@ class LimitManager:
         if last_over != date.today():
             extra_s = 0
 
-        # сколько осталось базовых секунд
         base_remaining = max(0, base_limit - used_s)
 
-        # часть уходит в базу, остаток — из докупленных
         consume_from_base = min(base_remaining, additional_seconds)
         consume_from_overage = max(0, additional_seconds - consume_from_base)
 
@@ -75,3 +74,6 @@ class LimitManager:
                 f"Докуплено на сегодня: {extra_s // 60} мин.\n"
                 f"Осталось сегодня (всего): {remaining_total // 60} мин.\n"
                 f"Базовый дневной лимит: {base_limit // 60} мин.")
+
+# ✅ ВАЖНО: экспортируем инстанс для импорта в bot.py
+limit_manager = LimitManager()
