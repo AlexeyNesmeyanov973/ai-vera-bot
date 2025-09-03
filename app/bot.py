@@ -272,9 +272,17 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         "pdf_path": result.get("pdf_path"),
                     }
 
-                    head = ""
+                    head_lines = []
                     if result.get("title"):
-                        head = f"✅ *{result['title']}*\nДлительность: {format_seconds(result['duration'])}\n\n"
+                        head_lines.append(f"✅ *{result['title']}*")
+                    dur = result.get("duration") or 0
+                    head_lines.append(f"Длительность: {format_seconds(int(dur))}")
+                    if result.get("detected_language"):
+                        head_lines.append(f"Язык: `{result['detected_language']}`")
+                    if result.get("processing_time_s") is not None:
+                        head_lines.append(f"Обработка: {result['processing_time_s']} c")
+
+                    head = "\n".join(head_lines) + "\n\n"
 
                     text = result.get("text", "") or ""
                     MESSAGE_LIMIT = 3900  # запас к 4096
