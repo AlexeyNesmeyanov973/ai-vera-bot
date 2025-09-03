@@ -41,6 +41,9 @@ from app.bootstrap import run_startup_migrations
 from app.payments_bootstrap import payment_manager
 from app.pdf_generator import pdf_generator
 from app.translator import translate_text
+from app.analytics import analyze_text, build_report_md
+from app import storage
+
 
 
 # Приглушим шум от httpx (getUpdates каждые N секунд)
@@ -311,7 +314,14 @@ async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, file_type: str, url: str | None = None):
     queue_msg = await update.message.reply_text("📋 Задача поставлена в очередь...")
     try:
-        task_id = await task_queue.add_task(task_manager.process_transcription_task, update, context, file_type, url)
+        user_id = update.effective_user.id
+        priority = 0 if storage.is_pro(user_id) else 1
+        task_id = await task_queue.add_task(
+            task_manager.process_transcription_task,
+            update, context, file_type, url,
+            priority=priority
+        )
+
         while True:
             await asyncio.sleep(2)
             status = task_queue.get_task_status(task_id)
@@ -396,6 +406,10 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     )
                     await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
                     await update.message.reply_text("Нужен перевод текста?", reply_markup=_translation_keyboard())
+                    await update.message.reply_text("📊 Хотите посмотреть аналитику текста?", 
+                                                    reply_markup=InlineKeyboardMarkup(
+                                                        [[InlineKeyboardButton("📊 Показать аналитику", callback_data="analytics")]]
+                                                    ))
 
                     await queue_msg.edit_text("✅ Готово!")
                 else:
