@@ -1,5 +1,6 @@
 # app/task_queue.py
 import asyncio
+import os
 import logging
 import time
 import uuid
@@ -327,3 +328,10 @@ class TaskQueue:
         if graceful and self.active_tasks:
             # подождём, пока активные задачи дойдут до своих finally
             await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
+
+    try:
+        _MAXC = int(os.getenv("TASKQ_MAX_CONCURRENCY", "3"))
+    except Exception:
+        _MAXC = 3
+
+    task_queue = TaskQueue(max_concurrent_tasks=_MAXC)
