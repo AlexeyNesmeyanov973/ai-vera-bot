@@ -343,9 +343,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Точка входа ----------
 
 def main():
+    # Миграция PRO из ENV → Redis/Postgres
     run_startup_migrations()
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # колбэки жизненного цикла
+    async def _post_init(_):
+        await task_queue.start()
+
+    async def _post_shutdown(_):
+        await task_queue.stop()
+
+    # билдим приложение с колбэками
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -366,14 +381,9 @@ def main():
 
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:"))
 
-    async def _post_init(_):
-        await task_queue.start()
-
-    async def _post_stop(_):
-        await task_queue.stop()
-
     logger.info("Запуск бота AI-Vera (polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, post_init=_post_init, post_stop=_post_stop)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
