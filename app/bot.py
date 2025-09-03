@@ -351,10 +351,13 @@ async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Обработка через очередь ----------
 
 async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, file_type: str, url: str | None = None):
-    queue_msg = await update.message.reply_text("📋 Задача поставлена в очередь...")
+    user_id = update.effective_user.id
+    is_pro = storage.is_pro(user_id)
+    queue_msg = await update.message.reply_text(
+        f"📋 Задача поставлена в очередь…\nПриоритет: {_priority_badge(is_pro)}"
+    )
     try:
-        user_id = update.effective_user.id
-        priority = 0 if storage.is_pro(user_id) else 1
+        priority = 0 if is_pro else 1
         task_id = await task_queue.add_task(
             task_manager.process_transcription_task,
             update, context, file_type, url,
@@ -368,7 +371,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             if s == "completed":
                 result = status.get("result", {})
                 if result.get("success"):
-                    # Кэш последнего результата: для кнопок экспорта
                     context.user_data["last_transcription"] = {
                         "text": result.get("text", ""),
                         "segments": result.get("segments") or [],
@@ -383,35 +385,27 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
                     dur = result.get("duration") or 0
                     head_lines.append(f"Длительность: {format_seconds(int(dur))}")
-                    
-                    # Бейдж приоритета обслуживания
-                    is_pro_now = storage.is_pro(update.effective_user.id)
-                    head_lines.append(f"Приоритет: {_priority_badge(is_pro_now)}")
+                    head_lines.append(f"Приоритет: {_priority_badge(is_pro)}")
 
                     if result.get("detected_language"):
                         head_lines.append(f"Язык: {_lang_pretty(result['detected_language'])}")
 
-                    # Кол-во слов
                     if isinstance(result.get("word_count"), int) and result["word_count"] > 0:
                         head_lines.append(f"Слов: {result['word_count']}")
 
-                    # Время обработки
                     if result.get("processing_time_s") is not None:
-                        # округлим/приведём к человекочитаемому формату
                         secs = result["processing_time_s"]
                         head_lines.append(f"Обработка: {secs:.1f} c")
 
                     head = "\n".join(head_lines) + "\n\n"
 
                     text = result.get("text", "") or ""
-                    MESSAGE_LIMIT = 3900  # запас к 4096
+                    MESSAGE_LIMIT = 3900
                     if len(text) > MESSAGE_LIMIT:
-                        # 1) короткий анонс
                         if head:
                             await update.message.reply_text(head, parse_mode="Markdown")
                         await update.message.reply_text("📝 Текст длинный — отправляю файлом .txt")
 
-                        # 2) полный текст .txt
                         downloads = _ensure_downloads_dir()
                         filename_base = f"transcription_{uuid.uuid4().hex[:8]}"
                         txt_path = os.path.join(downloads, f"{filename_base}.txt")
@@ -424,7 +418,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             )
                         os.remove(txt_path)
 
-                        # 3) если есть авто-PDF — отправим
                         if result.get("pdf_path"):
                             try:
                                 with open(result["pdf_path"], "rb") as f:
@@ -435,10 +428,8 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             except Exception as e:
                                 logger.error(f"Ошибка отправки PDF: {e}")
                     else:
-                        # короткий текст — прямо в сообщении
                         await update.message.reply_text(head + f"📝 Результат:\n\n{text}", parse_mode="Markdown")
 
-                    # Инлайн-кнопки экспорта
                     keyboard = InlineKeyboardMarkup(
                         [
                             [
@@ -464,10 +455,10 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         )
                     )
                     await queue_msg.edit_text("✅ Готово!")
+
                 else:
                     err = result.get("error")
                     if err == "limit_exceeded":
-                        # Предложить фиксированные пакеты докупки минут
                         options = [10, 30, 60]
                         rows = []
                         for m in options:
@@ -496,6 +487,7 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 pos = stats["queue_size"] + stats["active_tasks"]
                 await queue_msg.edit_text(
                     f"⏳ Обрабатываю... Позиция: {pos}\n"
+                    f"Приоритет: {_priority_badge(is_pro)}\n"
                     f"Активных задач: {stats['active_tasks']}/{stats['max_concurrent']}"
                 )
     except Exception as e:
