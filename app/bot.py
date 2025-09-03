@@ -69,7 +69,7 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=False,
     )
 
-# ---------- Быстрый предчек размера TG-файлов (до скачивания) ----------
+# ---------- Быстрый предчек размера TG-файлов ----------
 
 def _get_tg_file_size_mb(update: Update, file_type: str) -> float | None:
     msg = update.message
@@ -90,7 +90,7 @@ def _get_tg_file_size_mb(update: Update, file_type: str) -> float | None:
 
 async def _reject_if_too_big(update: Update, file_type: str) -> bool:
     """
-    Если TG-файл больше MAX_FILE_SIZE_MB — сразу подсказка отправить ссылку (до URL_MAX_FILE_SIZE_MB).
+    Если TG-файл больше MAX_FILE_SIZE_MB — сразу просим прислать ссылку (до URL_MAX_FILE_SIZE_MB).
     Возвращает True, если нужно прервать дальнейшую обработку.
     """
     size_mb = _get_tg_file_size_mb(update, file_type)
@@ -170,15 +170,15 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     payment_url = payment_manager.get_payment_url(user_id)
     await update.message.reply_text(
-        "💎 *Перейдите на PRO версию!*\n\n"
-        "Преимущества:\n"
-        "• 🕐 больше минут в день\n"
-        "• ⚡ приоритет обработки\n"
-        "• 📁 все форматы\n\n"
-        f"[Оплатить PRO]({payment_url})",
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-        reply_markup=_main_menu_keyboard(),
+            "💎 *Перейдите на PRO версию!*\n\n"
+            "Преимущества:\n"
+            "• 🕐 больше минут в день\n"
+            "• ⚡ приоритет обработки\n"
+            "• 📁 все форматы\n\n"
+            f"[Оплатить PRO]({payment_url})",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=_main_menu_keyboard(),
     )
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
