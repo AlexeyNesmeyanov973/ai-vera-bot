@@ -308,20 +308,26 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
                     head_lines = []
                     if result.get("title"):
-                         head_lines.append(f"✅ *{result['title']}*")
+                        head_lines.append(f"✅ *{result['title']}*")
 
                     dur = result.get("duration") or 0
                     head_lines.append(f"Длительность: {format_seconds(int(dur))}")
 
-                    lang_pretty = None
                     if result.get("detected_language"):
-                          lang_pretty = _lang_pretty(result["detected_language"])
-                          head_lines.append(f"Язык: {lang_pretty}")
+                        head_lines.append(f"Язык: {_lang_pretty(result['detected_language'])}")
 
+                    # Кол-во слов
+                    if isinstance(result.get("word_count"), int) and result["word_count"] > 0:
+                        head_lines.append(f"Слов: {result['word_count']}")
+
+                    # Время обработки
                     if result.get("processing_time_s") is not None:
-                          head_lines.append(f"Обработка: {result['processing_time_s']} c")
+                        # округлим/приведём к человекочитаемому формату
+                        secs = result["processing_time_s"]
+                        head_lines.append(f"Обработка: {secs:.1f} c")
 
                     head = "\n".join(head_lines) + "\n\n"
+
 
 
                     text = result.get("text", "") or ""
