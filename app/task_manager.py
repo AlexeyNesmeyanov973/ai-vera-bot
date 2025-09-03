@@ -15,13 +15,13 @@ from app.config import (
     MAX_FILE_SIZE_MB,
     URL_MAX_FILE_SIZE_MB,
 )
-from app import storage  # может использоваться в расширениях
+from app import storage  # оставляю для совместимости/расширений
 from app.downloaders import (
     download_from_telegram,
     download_from_url,
 )
 from app.pdf_generator import pdf_generator
-from app.utils import get_audio_duration  # для оценки длительности локального файла
+from app.utils import get_audio_duration
 from app.diarizer import diarizer
 
 logger = logging.getLogger(__name__)
@@ -43,23 +43,24 @@ class TranscriptionResult:
 
 
 def _attach_speakers_to_segments(
-    segments: List[Dict],
-    diarization_turns: List[Dict],
+    segments: List[dict],
+    diarization_turns: List[dict],
     default_speaker: str = "SPK",
-) -> List[Dict]:
+) -> List[dict]:
     """
-    Назначает каждому сегменту лучшего спикера на основе максимального перекрытия
+    Назначает каждому сегменту спикера на основе максимального перекрытия
     с интервалами диаризации.
     segments: [{start, end, text, ...}]
     diarization_turns: [{start, end, speaker}, ...]
     """
-    if not segments or not diarization_turns:
-        # проставим дефолт там, где пусто
-        for seg in segments or []:
+    if not segments:
+        return segments
+    if not diarization_turns:
+        for seg in segments:
             seg.setdefault("speaker", default_speaker)
         return segments
 
-    # сгруппируем интервалы диаризации по спикерам
+    # Словарь спикер -> список интервалов (start, end)
     diar_by_spk: Dict[str, List[tuple[float, float]]] = {}
     for turn in diarization_turns:
         spk = str(turn.get("speaker") or "").strip() or default_speaker
@@ -148,7 +149,7 @@ class TaskManager:
         seg_time = str(max_minutes * 60)
         out_tpl = os.path.join(out_dir, "part_%03d.mp4")
 
-        # быстрый путь: без перекодирования
+        # Быстрый путь: без перекодирования
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
             "-c", "copy",
@@ -163,7 +164,7 @@ class TaskManager:
         if rc == 0 and chunked:
             return chunked
 
-        # fallback: в WAV с разбиением
+        # Fallback: в WAV с разбиением
         out_tpl = os.path.join(out_dir, "part_%03d.wav")
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
@@ -209,13 +210,11 @@ class TaskManager:
                 detected_language = p.get("language") or None
 
         text_joined = "\n\n".join(full_text).strip()
-        # грубый подсчёт слов
         word_count = len([w for w in text_joined.split() if any(ch.isalnum() for ch in w)])
-
         return text_joined, all_segments, total_duration, detected_language, word_count
 
     async def process_transcription_task(self, update, context, file_type: str, url: str | None = None) -> Dict:
-        from app.limit_manager import limit_manager  # локальный импорт, чтобы избежать циклов
+        from app.limit_manager import limit_manager  # чтобы не ловить циклические импорты
 
         user_id = update.effective_user.id
 
@@ -245,19 +244,19 @@ class TaskManager:
             logger.exception("Ошибка скачивания")
             return {"success": False, "error": "download_failed", "message": str(e)}
 
-        # если телега/yt не дали длительность — попробуем оценить из файла
+        # если длительность не пришла — оценим
         if media_duration <= 0:
             try:
                 media_duration = float(get_audio_duration(local_path))
             except Exception:
-                media_duration = 0.0  # пойдём дальше, окончательно спишем по факту
+                media_duration = 0.0
 
         # 2) Проверка лимитов
         ok, error_message, _, _ = limit_manager.can_process(user_id, int(media_duration) if media_duration > 0 else 0)
         if not ok:
             return {"success": False, "error": "limit_exceeded", "message": error_message or "Лимит исчерпан"}
 
-        # 3) Чанковать большой файл (по 30 минут)
+        # 3) Чанки
         try:
             chunks = self._chunk_media(local_path, max_minutes=30)
         except Exception:
@@ -274,18 +273,17 @@ class TaskManager:
             for idx, cpath in enumerate(chunks, start=1):
                 logger.info("Транскрибация %s/%s: %s", idx, len(chunks), cpath)
                 piece = await self._audio.transcribe(cpath, language=language)
-                # ожидаем {text, segments, duration, language?, title?}
-                per_parts.append(piece)
+                per_parts.append(piece)  # ожидаем {text, segments, duration, language?, title?}
         except Exception as e:
             logger.exception("Ошибка транскрибации")
             return {"success": False, "error": "transcribe_failed", "message": str(e)}
         processing_time_s = time.perf_counter() - started
 
-        # 5) Склейка результатов + метрики
+        # 5) Склейка
         full_text, all_segments, total_duration, detected_language, word_count = self._merge_texts(per_parts)
         title = downloaded_title or per_parts[0].get("title") or "Транскрибация"
 
-        # 5b) Диаризация спикеров (опционально)
+        # 5b) Диаризация (если включена/доступна)
         try:
             diar = diarizer.diarize(local_path)
             if diar:
@@ -293,7 +291,7 @@ class TaskManager:
         except Exception:
             logger.exception("Speaker attribution failed")
 
-        # 6) Списать минуты по фактической длительности
+        # 6) Списать минуты
         try:
             limit_manager.update_usage(user_id=user_id, additional_seconds=int(total_duration))
         except Exception:
