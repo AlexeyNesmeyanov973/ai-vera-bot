@@ -1,21 +1,17 @@
 python-telegram-bot==20.7
 python-dotenv==1.0.0
-# Оставляем openai-whisper (можно удалить, если используете только faster-whisper)
-openai-whisper==20231117
-torch==2.3.1
-# Быстрый CPU-бэкенд
-faster-whisper==1.0.3
 
+# Распознавание (CPU)
+faster-whisper==1.0.3
 ffmpeg-python==0.2.0
+pydub==0.25.1
 yt-dlp>=2024.08.06
 aiohttp==3.9.1
-pydub==0.25.1
+
+# PDF/изображения
 reportlab==4.0.4
 Pillow==10.0.0
-Flask>=2.3.0
-gunicorn>=21.2.0
 
-# Хранилища
+# Хранилища (опционально; оставь, если используешь)
 redis>=5.0.8
 psycopg[binary]>=3.2.1
-prometheus_client>=0.20.0
