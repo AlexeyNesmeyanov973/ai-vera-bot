@@ -1,3 +1,4 @@
+# /app/web
 @app.route("/webhook/prodamus", methods=["POST"])
 @WEBHOOK_LATENCY.time()
 def webhook_prodamus():
