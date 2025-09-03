@@ -31,5 +31,7 @@ deep-translator==1.11.4
 
 # === Диаризация (опционально) ===
 pyannote.audio==3.1.1
+python-docx==1.1.2
+
 
 
