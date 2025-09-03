@@ -4,6 +4,7 @@ services:
     runtime: docker
     dockerfilePath: Dockerfile
     dockerCommand: python -m app.bot
+    autoDeploy: true
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -17,20 +18,14 @@ services:
         value: "small"
       - key: WHISPER_LANGUAGE
         value: "auto"
-      - key: YOOKASSA_SHOP_ID
-        sync: false
-      - key: YOOKASSA_SECRET_KEY
-        sync: false
-      - key: YOOKASSA_RETURN_URL
-        sync: false
-      - key: YOOKASSA_PRO_AMOUNT
-        value: "299.0"
-      - key: PRODAMUS_WEBHOOK_SECRET
-        sync: false
-      - key: PRODAMUS_PAYMENT_LINK
-        sync: false
-      - key: PRODAMUS_PRO_AMOUNT
-        value: "299.0"
+      - key: TASKQ_MAX_CONCURRENCY
+        value: "3"
+      - key: MAX_FILE_SIZE_MB
+        value: "49"
+      - key: URL_MAX_FILE_SIZE_MB
+        value: "1024"
+      - key: OVERAGE_PRICE_RUB
+        value: "5"
       - key: REDIS_URL
         sync: false
       - key: DATABASE_URL
@@ -40,7 +35,9 @@ services:
     name: ai-vera-bot-web
     runtime: docker
     dockerfilePath: Dockerfile
-    dockerCommand: bash -lc 'exec gunicorn -w 2 -b 0.0.0.0:${PORT:-8000} app.web:app'
+    dockerCommand: bash -lc 'exec gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} app.web:app'
+    healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: YOOKASSA_SHOP_ID
         sync: false
@@ -60,4 +57,3 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
-    healthCheckPath: /health
