@@ -421,7 +421,10 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                 InlineKeyboardButton("📄 PDF", callback_data="export:pdf"),
                                 InlineKeyboardButton("📝 TXT", callback_data="export:txt"),
                             ],
-                            [InlineKeyboardButton("⏱️ SRT", callback_data="export:srt")],
+                            [
+                                InlineKeyboardButton("⏱️ SRT", callback_data="export:srt"),
+                                InlineKeyboardButton("🗣️ TXT (спикеры)", callback_data="export:txt_spk"),
+                            ],
                         ]
                     )
                     await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
@@ -493,11 +496,37 @@ def _make_srt_content(segments: list[dict]) -> str:
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", 0.0))
         text = (seg.get("text") or "").strip()
+        spk = seg.get("speaker")
+        if spk:
+            text = f"{spk}: {text}"
         lines.append(str(idx))
         lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
         lines.append(text)
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+def _make_speaker_txt(segments: list[dict]) -> str:
+    out_lines = []
+    cur = None
+    acc: list[str] = []
+
+    def flush():
+        nonlocal acc, cur
+        if acc:
+            out_lines.append(f"{cur or 'SPK'}: " + " ".join(acc))
+            acc = []
+
+    for seg in segments:
+        spk = seg.get("speaker")
+        txt = (seg.get("text") or "").strip()
+        if not txt:
+            continue
+        if spk != cur:
+            flush()
+            cur = spk
+        acc.append(txt)
+    flush()
+    return "\n\n".join(out_lines).strip()
 
 async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -553,13 +582,39 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             os.remove(srt_path)
 
+        elif kind == "txt_spk":
+            segments = data.get("segments") or []
+            if not segments or not any(s.get("speaker") for s in segments):
+                await query.edit_message_text("Пока нет разметки спикеров — отправляю обычный TXT.")
+                txt_path = os.path.join(downloads, f"{filename_base}.txt")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(data["text"])
+                with open(txt_path, "rb") as f:
+                    await query.message.reply_document(
+                        InputFile(f, filename=os.path.basename(txt_path)),
+                        caption="📝 TXT файл",
+                    )
+                os.remove(txt_path)
+                return
+
+            speaker_txt = _make_speaker_txt(segments)
+            spk_path = os.path.join(downloads, f"{filename_base}_speakers.txt")
+            with open(spk_path, "w", encoding="utf-8") as f:
+                f.write(speaker_txt)
+            with open(spk_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(spk_path)),
+                    caption="🗣️ TXT со спикерами",
+            )
+        os.remove(spk_path)
+
         else:
             await query.edit_message_text("Неизвестный формат экспорта.")
     except Exception:
         logger.exception("Export error")
         await query.edit_message_text("❌ Ошибка экспорта файла.")
 
-
+       
 async def export_translation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
