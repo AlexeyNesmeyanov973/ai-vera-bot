@@ -31,7 +31,7 @@ class TaskQueue:
     """
     Асинхронная очередь задач с настоящим приоритетом и лимитом concurrency.
 
-    Публичное API (обратная совместимость сохранена):
+    Публичное API:
       - add_task(func, *args, priority=1, _timeout=None, **kwargs) -> task_id
       - get_task_status(task_id) -> Dict
       - get_task_position(task_id) -> int | None
@@ -51,6 +51,9 @@ class TaskQueue:
 
         self.active_tasks: Dict[str, asyncio.Task] = {}
         self.task_results: Dict[str, Dict[str, Any]] = {}
+
+        # id задач, которые пользователь попросил отменить
+        self._canceled_ids: set[str] = set()
 
         self._is_running = False
         self._worker_task: Optional[asyncio.Task] = None
@@ -120,6 +123,15 @@ class TaskQueue:
 
                     if not item:
                         await asyncio.sleep(0.05)
+                        continue
+
+                    # если задачу успели отменить — пропускаем
+                    if item.id in self._canceled_ids:
+                        self._canceled_ids.discard(item.id)
+                        # если уже есть запись — обновим статус; если нет — создадим
+                        rec = self.task_results.setdefault(item.id, {"created_at": datetime.now()})
+                        rec.update({"status": "canceled", "completed_at": datetime.now(), "result": None, "error": "canceled"})
+                        logger.info("Задача %s пропущена (была отменена до старта)", item.id)
                         continue
 
                     task_id = item.id
@@ -192,28 +204,19 @@ class TaskQueue:
 
     def get_queue_stats(self) -> Dict[str, int]:
         """Короткая статистика по очереди."""
-        # Размер кучи читаем под локом
-        queue_size: int
-        if self._heap_lock.locked():
-            queue_size = len(self._heap)
-        else:
-            # безопасно взять под лок
-            queue_size = len(self._heap)
         return {
-            "queue_size": queue_size,
+            "queue_size": len(self._heap),
             "active_tasks": len(self.active_tasks),
             "total_tasks": len(self.task_results),
             "max_concurrent": self.max_concurrent_tasks,
         }
 
-    async def get_task_position(self, task_id: str) -> Optional[int]:
+    def get_task_position(self, task_id: str) -> Optional[int]:
         """
         Позиция задачи в очереди (0 — следующая к запуску).
         Если задача не в очереди (выполняется/завершена/нет) — None.
         """
-        async with self._heap_lock:
-            # heapq не отсортирован последовательно, поэтому нужно отсортировать копию ключей сортировки
-            items = list(self._heap)
+        items = list(self._heap)  # копия без лока — достаточная точность для UI
         if not items:
             return None
         items_sorted = sorted(items)  # использует порядок _PQItem
@@ -227,53 +230,29 @@ class TaskQueue:
         Отменяет задачу, если она в очереди или выполняется.
         True — если отменили.
         """
-        # 1) пытаемся убрать из кучи (под локом!)
-        removed = False
-        try:
-            # линейный поиск, затем heapify
-            # NB: lock в cancel — синхронный метод; очередь может вызываться из колбэков TG,
-            # поэтому используем .locked() + небольшую «схему обмена» через loop.run_until_complete
-            # Но тут у нас нет доступа к loop; в большинстве случаев этого хватает.
-            # Проще — использовать try/except вокруг без await (в IOLoop мы всё равно в одном треде)
-            # и принять риски редкой гонки при очень высокой нагрузке.
-            pass
-        except Exception:
-            pass
-
-        # Более корректно — через try_lock-подобный приём:
-        lock = self._heap_lock
-        if not lock.locked():
-            # быстрое редактирование под локом
-            async def _remove():
-                nonlocal removed
-                async with lock:
-                    for idx, it in enumerate(self._heap):
-                        if it.id == task_id:
-                            self._heap.pop(idx)
-                            import heapq
-                            heapq.heapify(self._heap)
-                            removed = True
-                            break
-            # запланируем и подождём немного (мы внутри синхронного метода)
-            try:
-                loop = asyncio.get_running_loop()
-                loop.run_until_complete(_remove())  # type: ignore
-            except RuntimeError:
-                # нет активного цикла — значит кто-то вызывает cancel из sync-контекста.
-                # В таком случае просто проигнорируем и отдадим false — крайне редкий кейс.
-                pass
-
-        if removed:
-            self.task_results[task_id]["status"] = "canceled"
-            self.task_results[task_id]["completed_at"] = datetime.now()
-            logger.info("Задача %s отменена (из очереди)", task_id)
-            return True
+        # 1) пытаемся убрать из кучи (без await — мы в одном треде event loop)
+        for idx, it in enumerate(self._heap):
+            if it.id == task_id:
+                self._heap.pop(idx)
+                import heapq
+                heapq.heapify(self._heap)
+                rec = self.task_results.setdefault(task_id, {"created_at": datetime.now()})
+                rec.update({"status": "canceled", "completed_at": datetime.now(), "result": None, "error": "canceled"})
+                logger.info("Задача %s отменена (из очереди)", task_id)
+                return True
 
         # 2) если уже выполняется — отменяем asyncio.Task
         task = self.active_tasks.get(task_id)
         if task and not task.done():
             task.cancel()
             logger.info("Задача %s запрошена к отмене (в работе)", task_id)
+            return True
+
+        # 3) возможно, воркер уже вытащил из кучи, но ещё не поставил статус.
+        # Пометим как отменённую — воркер увидит и пропустит.
+        if self.task_results.get(task_id, {}).get("status") in {"queued", "processing"}:
+            self._canceled_ids.add(task_id)
+            logger.info("Задача %s помечена как отменённая (ожидает в воркере)", task_id)
             return True
 
         return False
@@ -285,7 +264,6 @@ class TaskQueue:
         n = len(self.task_results)
         if n <= max_items:
             return
-        # упорядочим по created_at (если есть), иначе по insertion-order (3.7+)
         items = list(self.task_results.items())
         items.sort(key=lambda kv: kv[1].get("created_at", datetime.min))
         for task_id, _ in items[: n - max_items]:
@@ -322,16 +300,16 @@ class TaskQueue:
             for tid, t in list(self.active_tasks.items()):
                 if not t.done():
                     t.cancel()
-            # даём задачам обработать отмену
             await asyncio.sleep(0)
 
         if graceful and self.active_tasks:
-            # подождём, пока активные задачи дойдут до своих finally
             await asyncio.gather(*self.active_tasks.values(), return_exceptions=True)
 
-    try:
-        _MAXC = int(os.getenv("TASKQ_MAX_CONCURRENCY", "3"))
-    except Exception:
-        _MAXC = 3
 
-    task_queue = TaskQueue(max_concurrent_tasks=_MAXC)
+# --- Singleton-инстанс очереди для всего бота (ВАЖНО: на уровне модуля) ---
+try:
+    _MAXC = int(os.getenv("TASKQ_MAX_CONCURRENCY", "3"))
+except Exception:
+    _MAXC = 3
+
+task_queue = TaskQueue(max_concurrent_tasks=_MAXC)
