@@ -40,6 +40,8 @@ from app.task_manager import task_manager
 from app.bootstrap import run_startup_migrations
 from app.payments_bootstrap import payment_manager
 from app.pdf_generator import pdf_generator
+from app.translator import translate_text
+
 
 # Приглушим шум от httpx (getUpdates каждые N секунд)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -102,6 +104,25 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+    
+def _translation_keyboard() -> InlineKeyboardMarkup:
+    # Пары (код_языка, подпись)
+    options = [
+        ("ru", "На русский 🇷🇺"),
+        ("en", "На английский 🇬🇧"),
+        ("es", "На испанский 🇪🇸"),
+        ("de", "На немецкий 🇩🇪"),
+    ]
+    rows = []
+    for i in range(0, len(options), 2):
+        row = []
+        for code, label in options[i:i+2]:
+            InlineKeyboardButton(f"➡️ {label}", callback_data=f"trans:{code}")
+            for code, label in options[i:i+2]
+        ]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
 
 # ---------- Быстрый предчек размера TG-файлов ----------
 
@@ -328,8 +349,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
                     head = "\n".join(head_lines) + "\n\n"
 
-
-
                     text = result.get("text", "") or ""
                     MESSAGE_LIMIT = 3900  # запас к 4096
                     if len(text) > MESSAGE_LIMIT:
@@ -376,6 +395,7 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         ]
                     )
                     await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
+                    await update.message.reply_text("Нужен перевод текста?", reply_markup=_translation_keyboard())
 
                     await queue_msg.edit_text("✅ Готово!")
                 else:
@@ -450,6 +470,115 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         await query.edit_message_text("Нет недавнего результата для экспорта.")
         return
+
+    title = data.get("title") or "transcription"
+    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+    downloads = _ensure_downloads_dir()
+    filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
+
+    try:
+        if kind == "pdf":
+            pdf_path = data.get("pdf_path")
+            if not pdf_path:
+                pdf_path = os.path.join(downloads, f"{filename_base}.pdf")
+                pdf_generator.generate_transcription_pdf(data["text"], pdf_path, title=title)
+            with open(pdf_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(pdf_path)),
+                    caption="📄 PDF файл",
+                )
+            if not data.get("pdf_path") and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+
+        elif kind == "txt":
+            txt_path = os.path.join(downloads, f"{filename_base}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(data["text"])
+            with open(txt_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(txt_path)),
+                    caption="📝 TXT файл",
+                )
+            os.remove(txt_path)
+
+        elif kind == "srt":
+            segments = data.get("segments") or []
+            if not segments:
+                await query.edit_message_text("⏱️ Нет сегментов для SRT.")
+                return
+            srt_path = os.path.join(downloads, f"{filename_base}.srt")
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(_make_srt_content(segments))
+            with open(srt_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(srt_path)),
+                    caption="⏱️ SRT файл",
+                )
+            os.remove(srt_path)
+
+        else:
+            await query.edit_message_text("Неизвестный формат экспорта.")
+    except Exception:
+        logger.exception("Export error")
+        await query.edit_message_text("❌ Ошибка экспорта файла.")
+
+
+async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data.get("last_transcription")
+    if not data or not data.get("text"):
+        await query.edit_message_text("Нет текста для перевода.")
+        return
+
+    # формат: trans:<lang>
+    async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data.get("last_transcription")
+    if not data or not data.get("text"):
+        await query.edit_message_text("Нет текста для перевода.")
+        return
+
+    # формат: trans:<lang>
+    try:
+        target_lang = (query.data or "").split(":", 1)[1].strip().lower()
+    except Exception:
+        await query.edit_message_text("Не указан язык перевода.")
+        return
+
+    text = data["text"]
+    title = data.get("title") or "Транскрибация"
+
+    try:
+        await query.edit_message_text("🌐 Выполняю перевод, подождите...")
+        translated = await asyncio.to_thread(translate_text, text, target_lang, "auto")
+
+        MESSAGE_LIMIT = 3900
+        lang_str = _lang_pretty(target_lang)
+        head = f"🌐 *Перевод* → {lang_str}\nИз: *{title}*\n\n"
+
+        if len(translated) <= MESSAGE_LIMIT:
+            await query.message.reply_text(head + translated, parse_mode="Markdown")
+        else:
+            downloads = _ensure_downloads_dir()
+            safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+            filename = f"translation_{safe_title}_{target_lang}_{uuid.uuid4().hex[:6]}.txt"
+            path = os.path.join(downloads, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(translated)
+            with open(path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=filename),
+                    caption=f"🌐 Перевод → {lang_str}"
+                )
+            os.remove(path)
+
+    except Exception:
+        logger.exception("Translate callback error")
+        await query.edit_message_text("❌ Ошибка перевода. Попробуйте позже.")
 
     title = data.get("title") or "transcription"
     safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
@@ -592,6 +721,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_main_menu_keyboard()
     )
 
+    
 # ---------- Точка входа с «мягкой защитой» ----------
 
 def main():
@@ -631,6 +761,8 @@ def main():
 
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^buy:"))
+    app.add_handler(CallbackQueryHandler(translate_callback, pattern=r"^trans:"))
+
 
     logger.info("Запуск бота AI-Vera (polling)...")
 
