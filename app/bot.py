@@ -50,9 +50,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Языки: код -> (Название, Флаг) ---
+_LANG_MAP = {
+    "ru": ("Русский", "🇷🇺"),
+    "en": ("English", "🇬🇧"),   # можно переключить на 🇺🇸, если хочешь
+    "uk": ("Українська", "🇺🇦"),
+    "de": ("Deutsch", "🇩🇪"),
+    "fr": ("Français", "🇫🇷"),
+    "es": ("Español", "🇪🇸"),
+    "it": ("Italiano", "🇮🇹"),
+    "pt": ("Português", "🇵🇹"),
+    "pl": ("Polski", "🇵🇱"),
+    "tr": ("Türkçe", "🇹🇷"),
+    "kk": ("Қазақша", "🇰🇿"),
+    "uz": ("Oʻzbekcha", "🇺🇿"),
+    "az": ("Azərbaycanca", "🇦🇿"),
+    "he": ("עברית", "🇮🇱"),
+    "ar": ("العربية", "🇸🇦"),
+    "fa": ("فارسی", "🇮🇷"),
+    "hi": ("हिन्दी", "🇮🇳"),
+    "bn": ("বাংলা", "🇧🇩"),
+    "zh": ("中文", "🇨🇳"),
+    "ja": ("日本語", "🇯🇵"),
+    "ko": ("한국어", "🇰🇷"),
+    # добавляй по мере надобности
+}
+
+def _lang_pretty(code: str | None) -> str:
+    """Возвращает красивую строку вида 'English 🇬🇧 (en)'."""
+    if not code:
+        return "неизвестен 🌐"
+    c = code.lower().strip()
+    name, flag = _LANG_MAP.get(c, (c, "🌐"))
+    return f"{name} {flag} ({c})"
+
 # Подстраховка, если инстанс не экспортирован (ImportError)
 try:
     from app.limit_manager import limit_manager
+
 except ImportError:
     from app.limit_manager import LimitManager
     limit_manager = LimitManager()
@@ -274,15 +309,21 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
                     head_lines = []
                     if result.get("title"):
-                        head_lines.append(f"✅ *{result['title']}*")
+                         head_lines.append(f"✅ *{result['title']}*")
+
                     dur = result.get("duration") or 0
                     head_lines.append(f"Длительность: {format_seconds(int(dur))}")
+
+                    lang_pretty = None
                     if result.get("detected_language"):
-                        head_lines.append(f"Язык: `{result['detected_language']}`")
+                          lang_pretty = _lang_pretty(result["detected_language"])
+                          head_lines.append(f"Язык: {lang_pretty}")
+
                     if result.get("processing_time_s") is not None:
-                        head_lines.append(f"Обработка: {result['processing_time_s']} c")
+                          head_lines.append(f"Обработка: {result['processing_time_s']} c")
 
                     head = "\n".join(head_lines) + "\n\n"
+
 
                     text = result.get("text", "") or ""
                     MESSAGE_LIMIT = 3900  # запас к 4096
