@@ -52,50 +52,64 @@ class YooKassaManager:
             raise RuntimeError("YooKassa: confirmation_url is empty (topup)")
         return url
 
-    async def handle_webhook(self, payload: Dict) -> Dict:
+    
+async def handle_webhook(self, payload: Dict) -> Dict:
+    from app import storage
+
+    try:
+        obj = payload.get("object") or {}
+        payment_id = obj.get("id")
+        if not payment_id:
+            return {"success": False, "error": "No payment id in webhook"}
+
+        # Idempotency guard
+        if storage.is_payment_processed("yookassa", payment_id):
+            logger.info("YooKassa: duplicate webhook ignored (%s)", payment_id)
+            return {"success": True, "message": "already processed"}
+
+        payment = Payment.find_one(payment_id)
+        status = getattr(payment, "status", None)
+
+        meta = {}
         try:
-            obj = payload.get("object") or {}
-            payment_id = obj.get("id")
-            if not payment_id:
-                return {"success": False, "error": "No payment id in webhook"}
+            meta = payment.metadata or {}
+        except Exception:
+            pass
+        if not meta:
+            meta = obj.get("metadata") or {}
 
-            payment = Payment.find_one(payment_id)
-            status = getattr(payment, "status", None)
+        user_id_raw = meta.get("user_id")
+        if not user_id_raw:
+            return {"success": False, "error": "No user_id in metadata"}
 
-            meta = {}
-            try:
-                meta = payment.metadata or {}
-            except Exception:
-                pass
-            if not meta:
-                meta = obj.get("metadata") or {}
+        user_id = int(user_id_raw)
+        pay_type = (meta.get("type") or "").lower()
 
-            user_id_raw = meta.get("user_id")
-            if not user_id_raw:
-                return {"success": False, "error": "No user_id in metadata"}
+        if status == "succeeded":
+            # отметим как обработанный до побочных действий (чтобы повтор не дублировал)
+            storage.mark_payment_processed("yookassa", payment_id)
 
-            user_id = int(user_id_raw)
-            pay_type = (meta.get("type") or "").lower()
+            if pay_type == "topup":
+                minutes = int(meta.get("minutes") or "0")
+                if minutes > 0:
+                    storage.add_overage_seconds(user_id, minutes * 60)
+                    logger.info(f"YooKassa: user {user_id} TOPUP +{minutes}m (payment {payment_id})")
+                    return {"success": True, "message": f"user {user_id} topped up {minutes}m"}
+                return {"success": True, "message": "topup succeeded, but minutes=0"}
 
-            if status == "succeeded":
-                if pay_type == "topup":
-                    minutes = int(meta.get("minutes") or "0")
-                    if minutes > 0:
-                        storage.add_overage_seconds(user_id, minutes * 60)
-                        logger.info(f"YooKassa: user {user_id} TOPUP +{minutes}m (payment {payment_id})")
-                        return {"success": True, "message": f"user {user_id} topped up {minutes}m"}
-                    return {"success": True, "message": "topup succeeded, but minutes=0"}
-                # default → PRO
-                storage.add_pro(user_id)
-                logger.info(f"YooKassa: user {user_id} upgraded to PRO (payment {payment_id})")
-                return {"success": True, "message": f"user {user_id} upgraded to PRO"}
-            elif status in ("canceled", "cancelled"):
-                logger.info(f"YooKassa: payment canceled ({payment_id})")
-                return {"success": True, "message": "payment canceled"}
-            else:
-                logger.info(f"YooKassa webhook received, status={status} (no change)")
-                return {"success": True, "message": "Webhook received, no change"}
+            # default → PRO
+            storage.add_pro(user_id)
+            logger.info(f"YooKassa: user {user_id} upgraded to PRO (payment {payment_id})")
+            return {"success": True, "message": f"user {user_id} upgraded to PRO"}
 
-        except Exception as e:
-            logger.exception("YooKassa webhook error")
-            return {"success": False, "error": str(e)}
+        elif status in ("canceled", "cancelled"):
+            logger.info(f"YooKassa: payment canceled ({payment_id})")
+            return {"success": True, "message": "payment canceled"}
+
+        else:
+            logger.info(f"YooKassa webhook received, status={status} (no change)")
+            return {"success": True, "message": "Webhook received, no change"}
+
+    except Exception as e:
+        logger.exception("YooKassa webhook error")
+        return {"success": False, "error": str(e)}
