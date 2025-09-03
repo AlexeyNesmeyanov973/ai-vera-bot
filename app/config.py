@@ -26,7 +26,7 @@ WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru")     # "ru" или "auto"
 
 # === Лимиты ===
 FREE_USER_DAILY_LIMIT_MINUTES = 30
-PRO_USER_DAILY_LIMIT_MINUTES = 180
+PRO_USER_DAILY_LIMIT_MINUTES = 120
 MAX_FILE_SIZE_MB = 20
 
 # === Сверх лимита (докупка) ===
