@@ -42,7 +42,7 @@ from app.payments_bootstrap import payment_manager
 from app.pdf_generator import pdf_generator
 from app.translator import translate_text
 from app.analytics import analyze_text, build_report_md
-from app import storage
+
 
 
 
