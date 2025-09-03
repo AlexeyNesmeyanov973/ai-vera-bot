@@ -32,10 +32,8 @@ class PaymentManager:
 
     def _extract_signature(self, headers: Dict[str, str]) -> Optional[str]:
         for key in self.SIGNATURE_HEADER_CANDIDATES:
-            # Flask lowercases keys in request.headers? — это dict-like, но лучше пробовать точное имя
             if key in headers:
                 return headers.get(key)
-            # попробовать без учёта регистра
             for hk, hv in headers.items():
                 if hk.lower() == key.lower():
                     return hv
@@ -54,14 +52,9 @@ class PaymentManager:
             return False
 
     def _extract_user_id(self, payload: Dict) -> Optional[int]:
-        """
-        В Prodamus можно вернуть 'user_id' в вебхук через параметры ссылки/кастомные поля.
-        Пробуем популярные места.
-        """
         candidates = [
             payload.get("user_id"),
             (payload.get("order") or {}).get("user_id"),
-            # иногда платформы заворачивают поля:
             ((payload.get("custom_fields") or {}).get("user_id") if isinstance(payload.get("custom_fields"), dict) else None),
             ((payload.get("params") or {}).get("user_id") if isinstance(payload.get("params"), dict) else None),
             ((payload.get("client") or {}).get("user_id") if isinstance(payload.get("client"), dict) else None),
@@ -80,8 +73,6 @@ class PaymentManager:
         Универсальная обработка:
         - успешная оплата -> add_pro
         - возврат/отмена -> remove_pro
-        Ожидаем в payload что-то вроде:
-          { "status": "success", ... }  или  { "event": "payment.succeeded", ... }
         """
         try:
             user_id = self._extract_user_id(payload)
@@ -104,12 +95,9 @@ class PaymentManager:
                 logger.info(f"User {user_id} downgraded from PRO (refund)")
                 return {"success": True, "message": f"User {user_id} downgraded from PRO"}
 
-            # Если событие неизвестно, просто логируем
             logger.info(f"Получен вебхук Prodamus (без изменений статуса): event={event}, status={status}")
             return {"success": True, "message": "Webhook received"}
 
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             return {"success": False, "error": str(e)}
-
-    de
