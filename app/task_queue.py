@@ -1,4 +1,6 @@
 # app/task_queue.py
+from __future__ import annotations
+
 import asyncio
 import os
 import logging
@@ -6,9 +8,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Any, Dict, Tuple, Optional
+from typing import Callable, Any, Dict, Tuple, Optional, List
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["TaskQueue", "task_queue"]
 
 
 @dataclass(order=True)
@@ -45,15 +49,12 @@ class TaskQueue:
         self.max_concurrent_tasks = max_concurrent_tasks
 
         # приоритетная куча + блокировка
-        self._heap: list[_PQItem] = []
+        self._heap: List[_PQItem] = []
         self._heap_lock = asyncio.Lock()
         self._seq = 0
 
         self.active_tasks: Dict[str, asyncio.Task] = {}
         self.task_results: Dict[str, Dict[str, Any]] = {}
-
-        # id задач, которые пользователь попросил отменить
-        self._canceled_ids: set[str] = set()
 
         self._is_running = False
         self._worker_task: Optional[asyncio.Task] = None
@@ -125,15 +126,6 @@ class TaskQueue:
                         await asyncio.sleep(0.05)
                         continue
 
-                    # если задачу успели отменить — пропускаем
-                    if item.id in self._canceled_ids:
-                        self._canceled_ids.discard(item.id)
-                        # если уже есть запись — обновим статус; если нет — создадим
-                        rec = self.task_results.setdefault(item.id, {"created_at": datetime.now()})
-                        rec.update({"status": "canceled", "completed_at": datetime.now(), "result": None, "error": "canceled"})
-                        logger.info("Задача %s пропущена (была отменена до старта)", item.id)
-                        continue
-
                     task_id = item.id
                     self.task_results[task_id].update({
                         "status": "processing",
@@ -146,7 +138,6 @@ class TaskQueue:
                     self.active_tasks[task_id] = task
 
                 except asyncio.CancelledError:
-                    # корректное завершение воркера
                     break
                 except Exception as e:
                     logger.error("Ошибка в воркере очереди: %s", e, exc_info=True)
@@ -211,15 +202,16 @@ class TaskQueue:
             "max_concurrent": self.max_concurrent_tasks,
         }
 
-    def get_task_position(self, task_id: str) -> Optional[int]:
+    async def get_task_position(self, task_id: str) -> Optional[int]:
         """
         Позиция задачи в очереди (0 — следующая к запуску).
         Если задача не в очереди (выполняется/завершена/нет) — None.
         """
-        items = list(self._heap)  # копия без лока — достаточная точность для UI
+        async with self._heap_lock:
+            items = list(self._heap)
         if not items:
             return None
-        items_sorted = sorted(items)  # использует порядок _PQItem
+        items_sorted = sorted(items)  # порядок _PQItem
         for idx, it in enumerate(items_sorted):
             if it.id == task_id:
                 return idx
@@ -230,44 +222,43 @@ class TaskQueue:
         Отменяет задачу, если она в очереди или выполняется.
         True — если отменили.
         """
-        # 1) пытаемся убрать из кучи (без await — мы в одном треде event loop)
-        for idx, it in enumerate(self._heap):
-            if it.id == task_id:
-                self._heap.pop(idx)
-                import heapq
-                heapq.heapify(self._heap)
-                rec = self.task_results.setdefault(task_id, {"created_at": datetime.now()})
-                rec.update({"status": "canceled", "completed_at": datetime.now(), "result": None, "error": "canceled"})
-                logger.info("Задача %s отменена (из очереди)", task_id)
-                return True
+        # 1) Попробуем убрать из кучи (без блокировки — короткая операция, риск гонки минимален)
+        removed = False
+        try:
+            for idx, it in enumerate(self._heap):
+                if it.id == task_id:
+                    self._heap.pop(idx)
+                    import heapq
+                    heapq.heapify(self._heap)
+                    removed = True
+                    break
+        except Exception:
+            pass
 
-        # 2) если уже выполняется — отменяем asyncio.Task
+        if removed:
+            self.task_results.setdefault(task_id, {})["status"] = "canceled"
+            self.task_results[task_id]["completed_at"] = datetime.now()
+            logger.info("Задача %s отменена (из очереди)", task_id)
+            return True
+
+        # 2) Если уже выполняется — отменяем asyncio.Task
         task = self.active_tasks.get(task_id)
         if task and not task.done():
             task.cancel()
             logger.info("Задача %s запрошена к отмене (в работе)", task_id)
             return True
 
-        # 3) возможно, воркер уже вытащил из кучи, но ещё не поставил статус.
-        # Пометим как отменённую — воркер увидит и пропустит.
-        if self.task_results.get(task_id, {}).get("status") in {"queued", "processing"}:
-            self._canceled_ids.add(task_id)
-            logger.info("Задача %s помечена как отменённая (ожидает в воркере)", task_id)
-            return True
-
         return False
 
     def purge_old_results(self, max_items: int = 5000) -> None:
-        """
-        Ограничивает размер истории результатов, оставляя последние max_items.
-        """
+        """Ограничивает размер истории результатов, оставляя последние max_items."""
         n = len(self.task_results)
         if n <= max_items:
             return
         items = list(self.task_results.items())
         items.sort(key=lambda kv: kv[1].get("created_at", datetime.min))
-        for task_id, _ in items[: n - max_items]:
-            self.task_results.pop(task_id, None)
+        for tid, _ in items[: n - max_items]:
+            self.task_results.pop(tid, None)
 
     async def start(self):
         """Запускает воркер (идемпотентно)."""
@@ -286,7 +277,6 @@ class TaskQueue:
             return
         self._is_running = False
 
-        # останавливаем воркер
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -295,7 +285,6 @@ class TaskQueue:
                 pass
             self._worker_task = None
 
-        # по желанию отменяем активные задачи
         if cancel_active:
             for tid, t in list(self.active_tasks.items()):
                 if not t.done():
