@@ -1,17 +1,26 @@
 python-telegram-bot==20.7
 python-dotenv==1.0.0
 
-# Распознавание (CPU)
+# Whisper
+# openai-whisper — опционально, если захочешь backend=openai
+openai-whisper==20231117
+torch==2.3.1
+# быстрый CPU-бэкенд
 faster-whisper==1.0.3
+
 ffmpeg-python==0.2.0
-pydub==0.25.1
 yt-dlp>=2024.08.06
 aiohttp==3.9.1
-
-# PDF/изображения
+pydub==0.25.1
 reportlab==4.0.4
 Pillow==10.0.0
+Flask>=2.3.0
+gunicorn>=21.2.0
 
-# Хранилища (опционально; оставь, если используешь)
+# Хранилища
 redis>=5.0.8
 psycopg[binary]>=3.2.1
+prometheus_client>=0.20.0
+
+# Платежи
+yookassa==3.0.1

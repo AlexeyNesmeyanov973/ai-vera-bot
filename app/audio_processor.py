@@ -1,78 +1,83 @@
 import logging
-from app.config import WHISPER_BACKEND, WHISPER_MODEL
+from typing import Dict, List, Any
+from app.config import WHISPER_BACKEND, WHISPER_MODEL, WHISPER_LANGUAGE
 
 logger = logging.getLogger(__name__)
 
 class AudioProcessor:
     """
     Унифицированный интерфейс распознавания:
-    - WHISPER_BACKEND = "openai"  -> openai-whisper
-    - WHISPER_BACKEND = "faster"  -> faster-whisper
+    - WHISPER_BACKEND = "faster" (по умолчанию) -> faster-whisper
+    - WHISPER_BACKEND = "openai"                -> openai-whisper
+
+    WHISPER_LANGUAGE: "ru" / "auto" / любой ISO (en, de, ...)
     """
+
     def __init__(self):
-        self.backend = WHISPER_BACKEND
-        self.model_name = WHISPER_MODEL
+        self.backend = (WHISPER_BACKEND or "faster").lower()
+        self.model_name = WHISPER_MODEL or "small"
+        self.language = None if (WHISPER_LANGUAGE or "ru") == "auto" else WHISPER_LANGUAGE
         self._model = None
 
     def _load_openai_whisper(self):
-        import whisper
-        logger.info(f"Загрузка openai-whisper: {self.model_name}")
+        try:
+            import whisper
+        except Exception as e:
+            raise RuntimeError(
+                "WHISPER_BACKEND=openai, но пакет 'openai-whisper' не установлен.\n"
+                "Добавьте `openai-whisper==20231117` в requirements.txt или переключитесь на WHISPER_BACKEND=faster."
+            ) from e
+        logger.info(f"[whisper(openai)] загрузка модели: {self.model_name}")
         return whisper.load_model(self.model_name)
 
     def _load_faster_whisper(self):
         from faster_whisper import WhisperModel
-        # compute_type="int8" ускорит на CPU; можно выбрать "int8"|"float16"|"float32"
-        logger.info(f"Загрузка faster-whisper: {self.model_name}")
+        logger.info(f"[whisper(faster)] загрузка модели: {self.model_name} (cpu, int8)")
         return WhisperModel(self.model_name, device="cpu", compute_type="int8")
 
     def load_model(self):
         if self._model is not None:
             return
-        if self.backend == "openai":
-            self._model = self._load_openai_whisper()
-        else:
-            self._model = self._load_faster_whisper()
+        self._model = self._load_openai_whisper() if self.backend == "openai" else self._load_faster_whisper()
 
-    def transcribe_audio(self, audio_path: str) -> dict:
+    def transcribe_audio(self, audio_path: str) -> Dict[str, Any]:
         self.load_model()
-        if self.backend == "openai":
-            # Совместимый формат ответа
-            try:
-                result = self._model.transcribe(audio_path, language='ru', verbose=False)
-                return result
-            except Exception as e:
-                logger.error(f"Ошибка openai-whisper: {e}")
-                raise
-        else:
-            # faster-whisper -> приведём к совместимому формату
-            try:
-                segments, info = self._model.transcribe(audio_path, language="ru")
-                text = []
-                seg_list = []
-                for seg in segments:
-                    seg_list.append({
-                        "id": seg.id,
-                        "start": seg.start,
-                        "end": seg.end,
-                        "text": seg.text.strip()
-                    })
-                    text.append(seg.text)
-                return {"text": "".join(text).strip(), "segments": seg_list, "language": info.language}
-            except Exception as e:
-                logger.error(f"Ошибка faster-whisper: {e}")
-                raise
+        lang = self.language  # None -> авто
 
-    def format_transcription(self, result: dict, with_timestamps: bool = False) -> str:
-        if not result or 'text' not in result:
+        if self.backend == "openai":
+            result = self._model.transcribe(audio_path, language=lang, verbose=False)
+            segments_out: List[Dict[str, Any]] = []
+            for seg in result.get("segments") or []:
+                segments_out.append({
+                    "id": int(getattr(seg, "id", seg.get("id", 0))),
+                    "start": float(getattr(seg, "start", seg.get("start", 0.0))),
+                    "end": float(getattr(seg, "end", seg.get("end", 0.0))),
+                    "text": str(getattr(seg, "text", seg.get("text", ""))).strip(),
+                })
+            return {"text": (result.get("text") or "").strip(), "segments": segments_out, "language": result.get("language")}
+        else:
+            segments_iter, info = self._model.transcribe(audio_path, language=lang)
+            text_parts: List[str] = []
+            segments_out: List[Dict[str, Any]] = []
+            for seg in segments_iter:
+                t = (seg.text or "").strip()
+                text_parts.append(t)
+                segments_out.append({
+                    "id": int(seg.id),
+                    "start": float(seg.start or 0.0),
+                    "end": float(seg.end or 0.0),
+                    "text": t,
+                })
+            return {"text": "".join(text_parts).strip(), "segments": segments_out, "language": getattr(info, "language", None)}
+
+    def format_transcription(self, result: Dict[str, Any], with_timestamps: bool = False) -> str:
+        if not result or "text" not in result:
             return "Не удалось распознать текст."
         if not with_timestamps:
-            return result['text'].strip()
-        out = []
-        for seg in result.get('segments', []) or []:
-            start = seg.get('start', 0)
-            end = seg.get('end', 0)
-            text = seg.get('text', '').strip()
-            out.append(f"[{start:.0f}s-{end:.0f}s] {text}")
-        return "\n".join(out).strip()
+            return (result.get("text") or "").strip()
+        out_lines: List[str] = []
+        for seg in result.get("segments") or []:
+            out_lines.append(f"[{seg.get('start', 0):.0f}s-{seg.get('end', 0):.0f}s] {seg.get('text','').strip()}")
+        return "\n".join(out_lines).strip()
 
 audio_processor = AudioProcessor()

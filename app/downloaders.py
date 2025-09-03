@@ -31,8 +31,29 @@ class DownloadManager:
     def _is_google_drive_url(self, url: str) -> bool:
         return 'drive.google.com' in url
 
+    def _normalize_google_drive_url(self, url: str) -> str:
+        # /file/d/<ID>/view
+        m = re.search(r"drive\.google\.com/(?:.*?/)?file/d/([a-zA-Z0-9_-]{10,})", url)
+        if m:
+            file_id = m.group(1)
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+        # open?id=<ID>
+        m = re.search(r"drive\.google\.com/(?:.*)?open\?id=([a-zA-Z0-9_-]{10,})", url)
+        if m:
+            file_id = m.group(1)
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+        # uc?id=<ID>
+        m = re.search(r"drive\.google\.com/(?:.*)?uc\?.*?[&?]id=([a-zA-Z0-9_-]{10,})", url)
+        if m:
+            file_id = m.group(1)
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+        return url
+
     async def download_from_url(self, url: str) -> Optional[dict]:
         try:
+            if self._is_google_drive_url(url):
+                url = self._normalize_google_drive_url(url)
+
             if self._is_youtube_url(url):
                 return await self._download_youtube_video(url)
             elif self._is_yandex_disk_url(url) or self._is_google_drive_url(url):
@@ -61,7 +82,9 @@ class DownloadManager:
             def _work():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    audio_path = ydl.prepare_filename(info).replace('.webm', '.wav').replace('.m4a', '.wav')
+                    filename = ydl.prepare_filename(info)
+                    base, _ext = os.path.splitext(filename)
+                    audio_path = base + '.wav'
                     return info, audio_path
 
             info, audio_path = await asyncio.to_thread(_work)
@@ -93,7 +116,7 @@ class DownloadManager:
     async def _download_cloud_file(self, url: str) -> Optional[dict]:
         try:
             ydl_opts = {
-                'outtmpl': os.path.join(self.download_dir, '%(title)s.%(ext)s'),
+                'outtmpl': os.path.join(self.download_dir, '%(title).80s.%(ext)s'),
                 'quiet': True,
                 'no_warnings': True,
             }
@@ -109,19 +132,29 @@ class DownloadManager:
             if not os.path.exists(file_path):
                 raise Exception("Не удалось скачать файл")
 
-            if any(file_path.endswith(ext) for ext in ['.mp3', '.m4a', '.mp4', '.avi', '.mov']):
+            if any(file_path.lower().endswith(ext) for ext in ['.mp3', '.m4a', '.mp4', '.avi', '.mov', '.webm', '.mkv', '.ogg', '.flac']):
                 wav_path = file_path + '.wav'
                 if self.convert_to_wav(file_path, wav_path):
-                    os.remove(file_path)
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
                     file_path = wav_path
 
             duration_seconds = get_audio_duration(file_path)
             file_size_mb = get_file_size_mb(file_path)
 
             if file_size_mb > MAX_FILE_SIZE_MB:
-                os.remove(file_path)
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
                 logger.warning(f"Файл с облака превышает лимит: {file_size_mb} МБ")
                 return None
+
+            title = info.get('title') or 'Файл из облака'
+            if len(title) > 100:
+                title = title[:97] + '...'
 
             return {
                 'file_path': file_path,
@@ -129,7 +162,7 @@ class DownloadManager:
                 'duration_seconds': duration_seconds,
                 'file_size_mb': file_size_mb,
                 'file_type': 'cloud',
-                'title': info.get('title', 'Файл из облака')
+                'title': title
             }
 
         except Exception as e:
@@ -162,7 +195,10 @@ class DownloadManager:
 
             file_size_mb = get_file_size_mb(download_path)
             if file_size_mb > MAX_FILE_SIZE_MB:
-                os.remove(download_path)
+                try:
+                    os.remove(download_path)
+                except Exception:
+                    pass
                 await update.message.reply_text(
                     f"❌ Размер файла ({file_size_mb:.1f} МБ) превышает максимально допустимый ({MAX_FILE_SIZE_MB} МБ)."
                 )

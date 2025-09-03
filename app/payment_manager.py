@@ -1,7 +1,6 @@
 import logging
 import hmac
 import hashlib
-import json
 from typing import Dict, Optional
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 
@@ -13,11 +12,9 @@ class PaymentManager:
     """
     Интеграция с Prodamus:
     - Проверка подписи вебхука: HMAC-SHA256(raw_body, secret) == signature_header
-    - Ссылка на оплату: используем готовую ссылку из кабинета и добавляем ?user_id=...
+    - Ссылка на оплату: используем готовую ссылку и добавляем ?user_id=...
     """
 
-    # Подпись приходит "в заголовках запроса" (официальная справка Prodamus).
-    # Точное имя может различаться в интеграциях; поддержим несколько вариантов.
     SIGNATURE_HEADER_CANDIDATES = [
         "X-Prodamus-Signature",
         "X-Signature",
@@ -43,12 +40,12 @@ class PaymentManager:
         try:
             signature = self._extract_signature(headers)
             if not signature:
-                logger.warning("Подпись вебхука отсутствует в заголовках")
+                logger.warning("Prodamus: подпись вебхука отсутствует")
                 return False
             expected = hmac.new(self.webhook_secret, raw_payload, hashlib.sha256).hexdigest()
             return hmac.compare_digest(expected, signature)
         except Exception as e:
-            logger.error(f"Ошибка проверки подписи: {e}")
+            logger.error(f"Prodamus: ошибка проверки подписи: {e}")
             return False
 
     def _extract_user_id(self, payload: Dict) -> Optional[int]:
@@ -69,11 +66,6 @@ class PaymentManager:
         return None
 
     async def handle_webhook(self, payload: Dict) -> Dict:
-        """
-        Универсальная обработка:
-        - успешная оплата -> add_pro
-        - возврат/отмена -> remove_pro
-        """
         try:
             user_id = self._extract_user_id(payload)
             if not user_id:
@@ -87,17 +79,30 @@ class PaymentManager:
 
             if paid:
                 storage.add_pro(user_id)
-                logger.info(f"User {user_id} upgraded to PRO (Prodamus webhook)")
+                logger.info(f"Prodamus: user {user_id} upgraded to PRO")
                 return {"success": True, "message": f"User {user_id} upgraded to PRO"}
 
             if refunded:
                 storage.remove_pro(user_id)
-                logger.info(f"User {user_id} downgraded from PRO (refund)")
+                logger.info(f"Prodamus: user {user_id} downgraded from PRO")
                 return {"success": True, "message": f"User {user_id} downgraded from PRO"}
 
-            logger.info(f"Получен вебхук Prodamus (без изменений статуса): event={event}, status={status}")
+            logger.info(f"Prodamus: webhook received (no change): event={event}, status={status}")
             return {"success": True, "message": "Webhook received"}
-
         except Exception as e:
-            logger.error(f"Webhook error: {e}")
+            logger.error(f"Prodamus webhook error: {e}")
             return {"success": False, "error": str(e)}
+
+    def _append_query(self, base_url: str, extra: Dict[str, str]) -> str:
+        url = urlparse(base_url)
+        q = dict(parse_qsl(url.query, keep_blank_values=True))
+        q.update({k: str(v) for k, v in extra.items()})
+        new_query = urlencode(q)
+        return urlunparse((url.scheme, url.netloc, url.path, url.params, new_query, url.fragment))
+
+    def get_payment_url(self, user_id: int, amount: Optional[float] = None) -> str:
+        amt = amount if amount is not None else self.default_amount
+        if self.payment_link_base:
+            return self._append_query(self.payment_link_base, {"user_id": user_id, "amount": f"{amt:.2f}"})
+        # запасной вариант, если не задана готовая ссылка
+        return f"https://payform.prodamus.ru/?user_id={user_id}&amount={amt:.2f}"

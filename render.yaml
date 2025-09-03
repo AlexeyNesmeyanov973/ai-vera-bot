@@ -15,6 +15,16 @@ services:
         value: "faster"
       - key: WHISPER_MODEL
         value: "small"
+      - key: WHISPER_LANGUAGE
+        value: "auto"
+      - key: YOOKASSA_SHOP_ID
+        sync: false
+      - key: YOOKASSA_SECRET_KEY
+        sync: false
+      - key: YOOKASSA_RETURN_URL
+        sync: false
+      - key: YOOKASSA_PRO_AMOUNT
+        value: "299.0"
       - key: PRODAMUS_WEBHOOK_SECRET
         sync: false
       - key: PRODAMUS_PAYMENT_LINK
@@ -25,3 +35,35 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+
+  - type: web
+    name: ai-vera-bot-web
+    runtime: docker
+    dockerfilePath: Dockerfile
+    dockerCommand: python -m app.web
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: PRO_USER_IDS
+        sync: false
+      - key: YOOKASSA_SHOP_ID
+        sync: false
+      - key: YOOKASSA_SECRET_KEY
+        sync: false
+      - key: YOOKASSA_RETURN_URL
+        sync: false
+      - key: YOOKASSA_PRO_AMOUNT
+        value: "299.0"
+      - key: PRODAMUS_WEBHOOK_SECRET
+        sync: false
+      - key: PRODAMUS_PAYMENT_LINK
+        sync: false
+      - key: PRODAMUS_PRO_AMOUNT
+        value: "299.0"
+      - key: REDIS_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+    healthCheckPath: /health
