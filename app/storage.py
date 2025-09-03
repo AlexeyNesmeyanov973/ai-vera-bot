@@ -50,6 +50,15 @@ if DATABASE_URL:
               last_reset_date DATE NOT NULL
             );
             """)
+            # Таблица обработанных платежей (идемпотентность)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_payments (
+              provider TEXT NOT NULL,
+              payment_id TEXT NOT NULL,
+              processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (provider, payment_id)
+            );
+            """)
         logger.info("✅ Postgres подключен, таблицы готовы")
     except Exception as e:
         logger.warning(f"⚠️ Postgres недоступен: {e}")
@@ -58,10 +67,12 @@ if DATABASE_URL:
 # ---- Memory fallback ----
 # user_usage: сколько базовых секунд из дневного лимита уже израсходовано сегодня
 _mem_usage: dict[int, Tuple[int, date]] = {}  # user_id -> (used_seconds:int, last_reset_date:date)
-# pro_users: множество PRO пользователям
+# pro_users: множество PRO пользователей
 _mem_pro: set[int] = set()
 # user_overage: докупленные секунды на сегодня
 _mem_overage: dict[int, Tuple[int, date]] = {}  # user_id -> (extra_seconds:int, last_reset_date:date)
+# processed_payments: идемпотентность платежей
+_mem_processed: set[tuple[str, str]] = set()
 
 # ============================================================
 #                 БАЗОВЫЙ ЛИМИТ (user_usage)
@@ -362,41 +373,18 @@ def consume_overage_seconds(user_id: int, consume_seconds: int):
     remain = max(0, cur_extra - max(0, int(consume_seconds)))
     set_overage(user_id, remain, today)
 
-
 # ============================================================
-#                 ОБРАБОТАННЫЕ ПЛАТЕЖИ (idempotency)
+#                ИДЕМПОТЕНТНОСТЬ ПЛАТЕЖЕЙ
 # ============================================================
-
-# В Redis храним отдельные ключи вида payproc:{provider}:{payment_id} -> "1" (TTL ~90 дней)
-# В Postgres храним таблицу processed_payments(provider, payment_id) PK
-
-# Memory fallback
-_mem_processed: set[tuple[str, str]] = set()
-
-# Инициализация таблицы для Postgres (в блоке, где создаются таблицы):
-if _pg_conn:
-    try:
-        with _pg_conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS processed_payments (
-              provider TEXT NOT NULL,
-              payment_id TEXT NOT NULL,
-              processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              PRIMARY KEY (provider, payment_id)
-            );
-            """)
-    except Exception as e:
-        logger.warning(f"⚠️ Postgres processed_payments init error: {e}")
 
 def is_payment_processed(provider: str, payment_id: str) -> bool:
     if not provider or not payment_id:
         return False
 
-    # Redis
+    # Redis (храним в множестве pp:{provider})
     if _redis:
         try:
-            key = f"payproc:{provider}:{payment_id}"
-            return _redis.exists(key) == 1
+            return bool(_redis.sismember(f"pp:{provider}", payment_id))
         except Exception:
             pass
 
@@ -415,15 +403,17 @@ def is_payment_processed(provider: str, payment_id: str) -> bool:
     # Memory
     return (provider, payment_id) in _mem_processed
 
+
 def mark_payment_processed(provider: str, payment_id: str):
     if not provider or not payment_id:
         return
 
-    # Redis (TTL 90 дней)
+    # Redis (множество + общий TTL на ключ множества)
     if _redis:
         try:
-            key = f"payproc:{provider}:{payment_id}"
-            _redis.set(key, "1", ex=60 * 60 * 24 * 90)
+            key = f"pp:{provider}"
+            _redis.sadd(key, payment_id)
+            _redis.expire(key, 60 * 60 * 24 * 90)  # 90 дней
         except Exception:
             pass
 
@@ -432,7 +422,11 @@ def mark_payment_processed(provider: str, payment_id: str):
         try:
             with _pg_conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO processed_payments (provider, payment_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    """
+                    INSERT INTO processed_payments (provider, payment_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (provider, payment_id) DO NOTHING
+                    """,
                     (provider, payment_id),
                 )
         except Exception as e:
@@ -440,4 +434,3 @@ def mark_payment_processed(provider: str, payment_id: str):
 
     # Memory
     _mem_processed.add((provider, payment_id))
-
