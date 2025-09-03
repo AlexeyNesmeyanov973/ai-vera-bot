@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from typing import Dict, List, Any
 from app.config import WHISPER_BACKEND, WHISPER_MODEL, WHISPER_LANGUAGE
 
@@ -94,6 +95,14 @@ class AudioProcessor:
         Новое API: асинхронная обёртка.
         TaskManager ждёт именно этот метод.
         """
+        # если явно передали language — временно переопределим
+        if language is not None:
+            prev_lang = self.language
+            try:
+                self.language = language
+                return await asyncio.to_thread(self.transcribe_audio, audio_path)
+            finally:
+                self.language = prev_lang
         return await asyncio.to_thread(self.transcribe_audio, audio_path)
 
     def format_transcription(self, result: Dict[str, Any], with_timestamps: bool = False) -> str:
