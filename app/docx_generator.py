@@ -1,124 +1,230 @@
 # app/docx_generator.py
 import logging
-from typing import List, Dict, Optional
-from datetime import datetime
-
-from docx import Document
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+import os
+from typing import List, Dict, Tuple, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+except Exception as e:
+    Document = None  # type: ignore
+    logger.warning("python-docx не установлен. Добавьте 'python-docx' в requirements.txt")
 
-def _fmt_ts(t: float) -> str:
-    """HH:MM:SS для секунд с плавающей точкой."""
-    t = float(t or 0.0)
+
+# --------- ВСПОМОГАТЕЛЬНЫЕ ---------
+
+def _fmt_hhmmss(t: float) -> str:
+    t = max(0.0, float(t))
     s = int(t) % 60
-    m_total = int(t) // 60
-    h = m_total // 60
-    m = m_total % 60
+    m = (int(t) // 60) % 60
+    h = int(t) // 3600
     return f"{h:02}:{m:02}:{s:02}"
 
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
 
-# Палитра для спикеров (цикл по кругу)
-PALETTE = [
-    RGBColor(66, 133, 244),   # синий
-    RGBColor(234, 67, 53),    # красный
-    RGBColor(52, 168, 83),    # зелёный
-    RGBColor(251, 188, 5),    # жёлтый/оранжевый
-    RGBColor(171, 71, 188),   # фиолетовый
-    RGBColor(0, 172, 193),    # бирюзовый
-    RGBColor(255, 109, 0),    # оранжево-красный
-    RGBColor(123, 31, 162),   # тёмно-фиолетовый
+def _norm_text(s: str) -> str:
+    return " ".join((s or "").replace("\u200b", "").split()).strip()
+
+# фиксированный приятный набор цветов
+_SPEAKER_COLORS = [
+    RGBColor(33, 150, 243),   # синий
+    RGBColor(244, 67, 54),    # красный
+    RGBColor(76, 175, 80),    # зелёный
+    RGBColor(255, 193, 7),    # янтарь
+    RGBColor(156, 39, 176),   # фиолетовый
+    RGBColor(0, 188, 212),    # бирюза
+    RGBColor(255, 87, 34),    # оранжевый
+    RGBColor(121, 85, 72),    # коричневый
+    RGBColor(63, 81, 181),    # индиго
+    RGBColor(139, 195, 74),   # лайм
 ]
 
+def _speaker_color(speaker: str):
+    idx = abs(hash(speaker)) % len(_SPEAKER_COLORS)
+    return _SPEAKER_COLORS[idx]
+
+def _speaker_key(seg: Dict) -> str:
+    spk = (seg.get("speaker") or "").strip()
+    return spk if spk else "SPK"
+
+def _group_contiguous_by_speaker(segments: List[Dict]) -> List[Dict]:
+    """
+    Склеивает подряд идущие сегменты одного спикера в группы:
+    [{speaker, start, end, texts: [..]}]
+    """
+    groups: List[Dict] = []
+    cur: Optional[Dict] = None
+
+    for seg in segments or []:
+        text = _norm_text(seg.get("text") or "")
+        if not text:
+            continue
+        spk = _speaker_key(seg)
+        start = float(seg.get("start") or 0.0)
+        end = float(seg.get("end") or start)
+
+        if cur and cur["speaker"] == spk:
+            cur["end"] = max(cur["end"], end)
+            cur["texts"].append(text)
+        else:
+            if cur:
+                groups.append(cur)
+            cur = {"speaker": spk, "start": start, "end": end, "texts": [text]}
+
+    if cur:
+        groups.append(cur)
+    return groups
+
+def _collect_unique_speakers(segments: List[Dict]) -> List[str]:
+    s = []
+    seen = set()
+    for seg in segments or []:
+        spk = _speaker_key(seg)
+        if spk not in seen:
+            seen.add(spk)
+            s.append(spk)
+    return s
+
+
+# --------- ОФОРМЛЕНИЕ WORD ---------
+
+def _ensure_styles(doc, base_font: str = "DejaVu Sans"):
+    """
+    Настраиваем базовые стили: Normal, Title, SpeakerHeading, LegendHeading, LegendEntry.
+    """
+    styles = doc.styles
+
+    # Normal
+    normal = styles["Normal"]
+    normal.font.name = base_font
+    normal.font.size = Pt(11)
+
+    # Title (встроенный)
+    if "Title" in styles:
+        styles["Title"].font.name = base_font
+
+    # SpeakerHeading (параграфный)
+    if "SpeakerHeading" not in styles:
+        sp = styles.add_style("SpeakerHeading", WD_STYLE_TYPE.PARAGRAPH)
+        sp.base_style = styles["Heading 2"] if "Heading 2" in styles else styles["Normal"]
+        sp.font.name = base_font
+        sp.font.bold = True
+        sp.font.size = Pt(13)
+
+    # LegendHeading
+    if "LegendHeading" not in styles:
+        lh = styles.add_style("LegendHeading", WD_STYLE_TYPE.PARAGRAPH)
+        lh.base_style = styles["Heading 3"] if "Heading 3" in styles else styles["Normal"]
+        lh.font.name = base_font
+        lh.font.bold = True
+        lh.font.size = Pt(12)
+
+    # LegendEntry
+    if "LegendEntry" not in styles:
+        le = styles.add_style("LegendEntry", WD_STYLE_TYPE.PARAGRAPH)
+        le.base_style = styles["Normal"]
+        le.font.name = base_font
+        le.font.size = Pt(11)
+
+
+def _add_title_page(doc, title: str):
+    p = doc.add_paragraph()
+    run = p.add_run(title or "Транскрибация")
+    p.style = doc.styles["Title"] if "Title" in doc.styles else doc.styles["Normal"]
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    doc.add_paragraph("")  # отступ
+
+
+def _add_legend(doc, speakers: List[str], marker_char: str = "●"):
+    if not speakers:
+        return
+    doc.add_paragraph("Легенда", style="LegendHeading")
+    for spk in speakers:
+        line = doc.add_paragraph(style="LegendEntry")
+        run_marker = line.add_run(f"{marker_char} ")
+        color = _speaker_color(spk)
+        run_marker.font.color.rgb = color
+        run_marker.bold = True
+
+        run_name = line.add_run(spk)
+        run_name.bold = True
+    doc.add_paragraph("")  # отступ
+
+
+def _write_group(doc, group: Dict, with_timestamps: bool, marker_char: str):
+    """
+    Один блок: заголовок-спикер + его абзац(ы).
+    """
+    speaker = group["speaker"]
+    start = group["start"]
+    end = group["end"]
+    texts = group["texts"]
+
+    # Заголовок спикера
+    head = doc.add_paragraph(style="SpeakerHeading")
+    color = _speaker_color(speaker)
+
+    run_marker = head.add_run(f"{marker_char} ")
+    run_marker.font.color.rgb = color
+    run_marker.bold = True
+
+    run_name = head.add_run(speaker)
+    run_name.bold = True
+
+    if with_timestamps:
+        head.add_run(f"  [{_fmt_hhmmss(start)}–{_fmt_hhmmss(end)}]").italic = True
+
+    # Текст
+    body_text = " ".join(texts).strip()
+    # бьем по пустым строкам, если есть; иначе одним абзацем
+    parts = [p.strip() for p in body_text.split("\n\n") if p.strip()] or [body_text]
+    for par in parts:
+        para = doc.add_paragraph()
+        para.add_run(par)
+
+    # небольшой отступ между блоками
+    doc.add_paragraph("")
+
+
+# --------- ПУБЛИЧНЫЙ ИНТЕРФЕЙС ---------
 
 class DOCXGenerator:
     """
-    Генерация DOCX:
-      - generate_plain_docx: сплошной текст
-      - generate_speaker_docx: подзаголовки спикеров с цветными маркерами
+    Генератор DOCX:
+      - generate_plain_docx(text, output_path, title)
+      - generate_speaker_docx(segments, output_path, title, with_timestamps, show_legend, marker_char)
     """
 
-    def __init__(self):
-        pass
-
-    def _base_doc(self, title: str) -> Document:
-        doc = Document()
-
-        # Поля страницы
-        section = doc.sections[0]
-        section.top_margin = Cm(2.0)
-        section.bottom_margin = Cm(2.0)
-        section.left_margin = Cm(2.0)
-        section.right_margin = Cm(2.0)
-
-        styles = doc.styles
-
-        # Normal
-        normal = styles["Normal"]
-        normal.font.name = "DejaVu Sans"
-        normal.font.size = Pt(11)
-
-        # Title
-        if "Title" in styles:
-            st = styles["Title"]
-        else:
-            st = styles.add_style("Title", WD_STYLE_TYPE.PARAGRAPH)
-        st.font.name = "DejaVu Sans"
-        st.font.bold = True
-        st.font.size = Pt(20)
-
-        # Subtitle
-        if "Subtitle" in styles:
-            sub = styles["Subtitle"]
-        else:
-            sub = styles.add_style("Subtitle", WD_STYLE_TYPE.PARAGRAPH)
-        sub.font.name = "DejaVu Sans"
-        sub.font.size = Pt(10)
-
-        # Заголовок спикера (параграфный стиль)
-        if "SpeakerHeading" not in styles:
-            sh = styles.add_style("SpeakerHeading", WD_STYLE_TYPE.PARAGRAPH)
-            sh.font.name = "DejaVu Sans"
-            sh.font.bold = True
-            sh.font.size = Pt(13)
-            # немного воздуха сверху/снизу
-            sh.paragraph_format.space_before = Pt(6)
-            sh.paragraph_format.space_after = Pt(2)
-
-        # Сигнатура
-        if "SpeakerLabel" not in styles:
-            sp = styles.add_style("SpeakerLabel", WD_STYLE_TYPE.CHARACTER)
-            sp.font.name = "DejaVu Sans"
-            sp.font.bold = True
-
-        # Титульная часть
-        p = doc.add_paragraph(title, style="Title")
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-        meta = f"Сгенерировано: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-        doc.add_paragraph(meta, style="Subtitle")
-
-        return doc
-
     def generate_plain_docx(self, text: str, output_path: str, title: str = "Транскрибация") -> bool:
+        if Document is None:
+            logger.error("python-docx не установлен")
+            return False
         try:
-            doc = self._base_doc(title)
-            for block in (text or "").split("\n\n"):
-                b = block.strip()
-                if not b:
-                    continue
-                # Сохраняем многострочность
-                for line in b.split("\n"):
-                    doc.add_paragraph(line)
-                doc.add_paragraph("")  # пустая строка между абзацами
+            _ensure_parent_dir(output_path)
+            doc = Document()
+            _ensure_styles(doc)
+
+            _add_title_page(doc, title)
+
+            # абзацы по двойному переносу
+            blocks = [b.strip() for b in (text or "").split("\n\n") if b.strip()]
+            if not blocks:
+                blocks = [(text or "").strip()]
+
+            for b in blocks:
+                doc.add_paragraph(b)
 
             doc.save(output_path)
             return True
-        except Exception as e:
-            logger.error(f"DOCX plain generation error: {e}")
+        except Exception:
+            logger.exception("Ошибка генерации DOCX (plain)")
             return False
 
     def generate_speaker_docx(
@@ -128,112 +234,57 @@ class DOCXGenerator:
         title: str = "Транскрибация",
         with_timestamps: bool = True,
         show_legend: bool = True,
-        marker_char: str = "●",  # можно поменять на "■", "●", "◆"
+        marker_char: str = "●",
     ) -> bool:
-        """
-        Ожидает сегменты вида:
-          {"start": float, "end": float, "text": str, "speaker": "SPK1"}
-        Формат:
-          <цветной маркер> SPK1  [HH:MM:SS–HH:MM:SS]
-          текст...
-        """
+        if Document is None:
+            logger.error("python-docx не установлен")
+            return False
         try:
-            doc = self._base_doc(title)
+            if not segments or not any((seg.get("speaker") or "").strip() for seg in segments):
+                # нет диаризации — тревиально скатываемся в обычный DOCX
+                full_text = " ".join(_norm_text(s.get("text") or "") for s in segments or []).strip()
+                return self.generate_plain_docx(full_text, output_path, title=title)
 
-            # Сшиваем подряд фразы одного спикера
-            groups: List[Dict] = []
-            cur_spk: Optional[str] = None
-            acc_lines: List[str] = []
-            span_start: Optional[float] = None
-            span_end: Optional[float] = None
+            _ensure_parent_dir(output_path)
+            doc = Document()
+            _ensure_styles(doc)
 
-            def flush():
-                nonlocal cur_spk, acc_lines, span_start, span_end
-                if not acc_lines:
-                    return
-                groups.append({
-                    "speaker": cur_spk or "SPK",
-                    "start": float(span_start or 0.0),
-                    "end": float(span_end or (span_start or 0.0)),
-                    "text": " ".join(acc_lines).strip()
-                })
-                acc_lines = []
-                span_start = None
-                span_end = None
+            _add_title_page(doc, title)
 
-            for seg in segments or []:
-                txt = (seg.get("text") or "").strip()
-                if not txt:
-                    continue
-                spk = seg.get("speaker") or "SPK"
-                s0 = float(seg.get("start") or 0.0)
-                e0 = float(seg.get("end") or s0)
+            if show_legend:
+                speakers = _collect_unique_speakers(segments)
+                _add_legend(doc, speakers, marker_char=marker_char)
 
-                if spk != cur_spk:
-                    flush()
-                    cur_spk = spk
-                    span_start = s0
-                    span_end = e0
-                else:
-                    if span_start is None:
-                        span_start = s0
-                    span_end = e0
-                acc_lines.append(txt)
-            flush()
-
-            # Карта цветов спикеров по порядку появления
-            speaker_order = []
-            color_map: Dict[str, RGBColor] = {}
+            groups = _group_contiguous_by_speaker(segments)
             for g in groups:
-                spk = g["speaker"]
-                if spk not in color_map:
-                    speaker_order.append(spk)
-                    color_map[spk] = PALETTE[(len(color_map)) % len(PALETTE)]
-
-            # Легенда
-            if show_legend and color_map:
-                doc.add_paragraph("")  # отступ
-                lg = doc.add_paragraph("Спикеры:", style="Subtitle")
-                for spk in speaker_order:
-                    p = doc.add_paragraph()
-                    run_marker = p.add_run(f"{marker_char} ")
-                    run_marker.font.bold = True
-                    run_marker.font.color.rgb = color_map[spk]
-
-                    run_name = p.add_run(spk)
-                    run_name.bold = True
-
-            # Контент по группам
-            for g in groups:
-                spk = g["speaker"]
-                s0 = g["start"]
-                e0 = g["end"]
-                body = g["text"]
-
-                # Подзаголовок спикера с цветным маркером
-                hdr = doc.add_paragraph(style="SpeakerHeading")
-
-                run_marker = hdr.add_run(marker_char + " ")
-                run_marker.font.bold = True
-                run_marker.font.color.rgb = color_map.get(spk, RGBColor(0, 0, 0))
-
-                run_spk = hdr.add_run(spk)
-                run_spk.bold = True
-
-                if with_timestamps:
-                    hdr.add_run(f"  [{_fmt_ts(s0)}–{_fmt_ts(e0)}]")
-
-                # Текст группы — обычным абзацем
-                # Сохраним переносы, если вдруг в тексте носители \n
-                for i, line in enumerate(body.split("\n")):
-                    doc.add_paragraph(line.strip())
-                doc.add_paragraph("")  # пустая строка между блоками
+                _write_group(doc, g, with_timestamps=with_timestamps, marker_char=marker_char)
 
             doc.save(output_path)
             return True
-        except Exception as e:
-            logger.error(f"DOCX speakers generation error: {e}")
+        except Exception:
+            logger.exception("Ошибка генерации DOCX (speakers)")
             return False
 
 
+# Экспортируем удобный инстанс и функции-обёртки (совместимость с твоими вызовами)
 docx_generator = DOCXGenerator()
+
+def generate_plain_docx(text: str, output_path: str, title: str = "Транскрибация") -> bool:
+    return docx_generator.generate_plain_docx(text, output_path, title=title)
+
+def generate_speaker_docx(
+    segments: List[Dict],
+    output_path: str,
+    title: str = "Транскрибация",
+    with_timestamps: bool = True,
+    show_legend: bool = True,
+    marker_char: str = "●",
+) -> bool:
+    return docx_generator.generate_speaker_docx(
+        segments=segments,
+        output_path=output_path,
+        title=title,
+        with_timestamps=with_timestamps,
+        show_legend=show_legend,
+        marker_char=marker_char,
+    )
