@@ -1,9 +1,6 @@
-# app/task_manager.py
 import os
 import logging
-from typing import Dict, Any, Optional, List
-from pydub import AudioSegment
-
+from typing import Dict, Any
 from app.downloaders import download_manager
 from app.audio_processor import audio_processor
 from app.limit_manager import limit_manager
@@ -11,148 +8,117 @@ from app.pdf_generator import pdf_generator
 
 logger = logging.getLogger(__name__)
 
-# Длительность чанка (в секундах)
-CHUNK_DURATION = 300  # 5 минут
-
-
 class TaskManager:
-    """Менеджер для обработки задач транскрибации с поддержкой чанкования."""
+    """Менеджер для обработки задач транскрибации."""
 
-    def _chunk_wav(self, wav_path: str) -> List[str]:
+    async def process_transcription_task(self, update, context, file_type: str, url: str = None) -> Dict[str, Any]:
         """
-        Делит WAV-файл на чанки по CHUNK_DURATION секунд.
-        Возвращает список временных путей к чанкам.
-        """
-        audio = AudioSegment.from_wav(wav_path)
-        total_ms = len(audio)
-        chunk_paths = []
-
-        for i, start_ms in enumerate(range(0, total_ms, CHUNK_DURATION * 1000)):
-            end_ms = min(start_ms + CHUNK_DURATION * 1000, total_ms)
-            chunk = audio[start_ms:end_ms]
-
-            chunk_path = f"{wav_path}.part{i}.wav"
-            chunk.export(chunk_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
-            chunk_paths.append(chunk_path)
-
-        return chunk_paths
-
-    async def process_transcription_task(
-        self, update, context, file_type: str, url: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Обработка медиафайла или ссылки (с чанкованием длинных файлов).
+        Основная задача для обработки медиафайла или ссылки.
+        Возвращает словарь результата:
+        {
+          success: bool,
+          error: str|None,
+          message: str|None,
+          text: str|None,
+          duration: int|None,
+          user_id: int,
+          file_type: str,
+          is_url: bool,
+          pdf_path: str|None,
+          title: str,
+          overage_minutes: int,
+          overage_cost: float
+        }
         """
         user = update.effective_user
         user_id = user.id
 
-        file_info: Optional[Dict[str, Any]] = None
-        wav_path: Optional[str] = None
-        chunk_paths: List[str] = []
+        file_info = None
+        wav_path = None
 
         try:
-            # 1) Загрузка
+            # 1) Скачать / подготовить вход
             if url:
                 file_info = await download_manager.download_from_url(url)
                 if not file_info:
-                    return {"success": False, "error": "download_failed", "is_url": True}
+                    return {'success': False, 'error': 'download_failed', 'is_url': True, 'user_id': user_id, 'file_type': file_type}
             else:
                 file_info = await download_manager.download_file(update, context, file_type)
                 if not file_info:
-                    return {"success": False, "error": "download_failed", "is_url": False}
+                    return {'success': False, 'error': 'download_failed', 'is_url': False, 'user_id': user_id, 'file_type': file_type}
 
-            # 2) Проверка лимитов
-            ok, error_message, _remaining_after = limit_manager.can_process(
-                user_id, file_info["duration_seconds"]
-            )
-            if not ok:
-                return {"success": False, "error": "limit_exceeded", "message": error_message}
+            duration_s = int(file_info.get('duration_seconds') or 0)
 
-            # 3) Конвертация в WAV
-            src_path = file_info["file_path"]
-            if not src_path.lower().endswith(".wav"):
-                wav_path = src_path + ".wav"
-                if not download_manager.convert_to_wav(src_path, wav_path):
-                    return {"success": False, "error": "conversion_failed"}
+            # 2) Проверить лимиты (+ возможная докупка)
+            check = limit_manager.can_process(user_id, duration_s)
+            # Поддерживаем старый (3 значения) и новый (5 значений) формат
+            over_minutes = 0
+            over_cost = 0.0
+            if isinstance(check, (tuple, list)) and len(check) >= 3:
+                ok, err_msg, remaining = check[0], check[1], check[2]
+                if len(check) >= 5:
+                    over_minutes = int(check[3] or 0)
+                    over_cost = float(check[4] or 0.0)
             else:
-                wav_path = src_path
+                ok, err_msg, remaining = False, "Internal limits error", 0
 
-            # 4) Чанкование WAV
-            chunk_paths = self._chunk_wav(wav_path)
+            if not ok and over_minutes <= 0:
+                # полностью упёрлись в лимит, докупки нет
+                download_manager.cleanup_file(file_info['file_path'])
+                return {'success': False, 'error': 'limit_exceeded', 'message': err_msg, 'user_id': user_id, 'file_type': file_type, 'is_url': bool(url)}
 
-            # 5) Транскрибация чанков
-            full_text_parts: List[str] = []
-            full_segments: List[Dict[str, Any]] = []
-            offset = 0.0
-            language = None
+            # 3) Конвертировать в WAV при необходимости
+            if not file_info['file_path'].endswith('.wav'):
+                wav_path = file_info['file_path'] + '.wav'
+                if not download_manager.convert_to_wav(file_info['file_path'], wav_path):
+                    download_manager.cleanup_file(file_info['file_path'])
+                    return {'success': False, 'error': 'conversion_failed', 'user_id': user_id, 'file_type': file_type, 'is_url': bool(url)}
+            else:
+                wav_path = file_info['file_path']
 
-            for idx, chunk_path in enumerate(chunk_paths):
-                logger.info(f"Обработка чанка {idx+1}/{len(chunk_paths)}: {chunk_path}")
-                result = audio_processor.transcribe_audio(chunk_path)
-                text = result.get("text", "").strip()
-                segments = result.get("segments", [])
+            # 4) Транскрибировать
+            transcription_result = audio_processor.transcribe_audio(wav_path)
 
-                # Сдвигаем тайм-коды
-                for seg in segments:
-                    seg["start"] += offset
-                    seg["end"] += offset
-                    full_segments.append(seg)
+            # 5) Списать фактическое использование (и учесть овередж)
+            limit_manager.update_usage(user_id, duration_s, overage_minutes=over_minutes, overage_cost=over_cost)
 
-                if text:
-                    full_text_parts.append(text)
-                if not language and result.get("language"):
-                    language = result.get("language")
-
-                offset += CHUNK_DURATION
-
-            transcription_result = {
-                "text": " ".join(full_text_parts).strip(),
-                "segments": full_segments,
-                "language": language,
-            }
-
+            # 6) Сформировать текст
             transcription_text = audio_processor.format_transcription(transcription_result)
 
-            # 6) Обновляем лимиты
-            limit_manager.update_usage(user_id, file_info["duration_seconds"])
-
-            # 7) PDF (по желанию)
+            # 7) PDF по длинным текстам
             pdf_path = None
             if len(transcription_text) > 1000:
-                pdf_path = wav_path + ".pdf"
-                title = file_info.get("title", "Транскрибация")
+                pdf_path = wav_path + '.pdf'
+                title = file_info.get('title', 'Транскрибация')
                 pdf_generator.generate_transcription_pdf(transcription_text, pdf_path, title)
 
-            return {
-                "success": True,
-                "text": transcription_text,
-                "segments": full_segments,
-                "duration": file_info["duration_seconds"],
-                "user_id": user_id,
-                "file_type": file_type,
-                "is_url": bool(url),
-                "pdf_path": pdf_path if pdf_path and os.path.exists(pdf_path) else None,
-                "title": file_info.get("title", "Файл"),
+            result = {
+                'success': True,
+                'text': transcription_text,
+                'duration': duration_s,
+                'user_id': user_id,
+                'file_type': file_type,
+                'is_url': bool(url),
+                'pdf_path': pdf_path if pdf_path and os.path.exists(pdf_path) else None,
+                'title': file_info.get('title', 'Файл'),
+                'overage_minutes': over_minutes,
+                'overage_cost': over_cost
             }
+            return result
 
         except Exception as e:
-            logger.exception("Ошибка в задаче транскрибации")
-            return {"success": False, "error": str(e)}
-
+            logger.error("Ошибка в задаче транскрибации", exc_info=True)
+            return {'success': False, 'error': str(e), 'user_id': user_id, 'file_type': file_type, 'is_url': bool(url)}
         finally:
-            # Очистка файлов
+            # очистка
             try:
-                if file_info and file_info.get("file_path"):
-                    if wav_path and file_info["file_path"] != wav_path:
-                        os.remove(file_info["file_path"])
-                if wav_path and os.path.exists(wav_path):
-                    os.remove(wav_path)
-                for cp in chunk_paths:
-                    if os.path.exists(cp):
-                        os.remove(cp)
-            except Exception as e:
-                logger.debug(f"Ошибка очистки файлов: {e}")
+                if file_info and file_info.get('file_path'):
+                    download_manager.cleanup_file(file_info['file_path'])
+                if wav_path and os.path.exists(wav_path) and (not file_info or wav_path != file_info.get('file_path')):
+                    download_manager.cleanup_file(wav_path)
+            except Exception:
+                pass
 
 
-# Глобальный экземпляр менеджера задач
+# Глобальный экземпляр
 task_manager = TaskManager()
