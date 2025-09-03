@@ -15,6 +15,13 @@ WEBHOOK_LATENCY = Histogram("webhook_latency_seconds", "Webhook processing time"
 
 app = Flask(__name__)
 
+@app.before_first_request
+def _migrate_on_first_request():
+    try:
+        run_startup_migrations()
+    except Exception:
+        logger.exception("Startup migrations failed in web app")
+
 @app.before_request
 def _before_request():
     try:
