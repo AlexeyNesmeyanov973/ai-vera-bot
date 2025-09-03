@@ -4,7 +4,7 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 from docx import Document
-from docx.shared import Pt, Cm
+from docx.shared import Pt, Cm, RGBColor
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
@@ -21,11 +21,24 @@ def _fmt_ts(t: float) -> str:
     return f"{h:02}:{m:02}:{s:02}"
 
 
+# Палитра для спикеров (цикл по кругу)
+PALETTE = [
+    RGBColor(66, 133, 244),   # синий
+    RGBColor(234, 67, 53),    # красный
+    RGBColor(52, 168, 83),    # зелёный
+    RGBColor(251, 188, 5),    # жёлтый/оранжевый
+    RGBColor(171, 71, 188),   # фиолетовый
+    RGBColor(0, 172, 193),    # бирюзовый
+    RGBColor(255, 109, 0),    # оранжево-красный
+    RGBColor(123, 31, 162),   # тёмно-фиолетовый
+]
+
+
 class DOCXGenerator:
     """
     Генерация DOCX:
-      - обычный (сплошной текст)
-      - со спикерами (speaker-labeled)
+      - generate_plain_docx: сплошной текст
+      - generate_speaker_docx: подзаголовки спикеров с цветными маркерами
     """
 
     def __init__(self):
@@ -41,7 +54,6 @@ class DOCXGenerator:
         section.left_margin = Cm(2.0)
         section.right_margin = Cm(2.0)
 
-        # Базовые стили: DejaVu Sans (есть в образе)
         styles = doc.styles
 
         # Normal
@@ -66,13 +78,23 @@ class DOCXGenerator:
         sub.font.name = "DejaVu Sans"
         sub.font.size = Pt(10)
 
-        # SpeakerLabel
+        # Заголовок спикера (параграфный стиль)
+        if "SpeakerHeading" not in styles:
+            sh = styles.add_style("SpeakerHeading", WD_STYLE_TYPE.PARAGRAPH)
+            sh.font.name = "DejaVu Sans"
+            sh.font.bold = True
+            sh.font.size = Pt(13)
+            # немного воздуха сверху/снизу
+            sh.paragraph_format.space_before = Pt(6)
+            sh.paragraph_format.space_after = Pt(2)
+
+        # Сигнатура
         if "SpeakerLabel" not in styles:
             sp = styles.add_style("SpeakerLabel", WD_STYLE_TYPE.CHARACTER)
             sp.font.name = "DejaVu Sans"
             sp.font.bold = True
 
-        # Title block
+        # Титульная часть
         p = doc.add_paragraph(title, style="Title")
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
@@ -84,7 +106,6 @@ class DOCXGenerator:
     def generate_plain_docx(self, text: str, output_path: str, title: str = "Транскрибация") -> bool:
         try:
             doc = self._base_doc(title)
-            # Основной текст (разобьём по абзацам)
             for block in (text or "").split("\n\n"):
                 b = block.strip()
                 if not b:
@@ -106,15 +127,21 @@ class DOCXGenerator:
         output_path: str,
         title: str = "Транскрибация",
         with_timestamps: bool = True,
+        show_legend: bool = True,
+        marker_char: str = "●",  # можно поменять на "■", "●", "◆"
     ) -> bool:
         """
         Ожидает сегменты вида:
           {"start": float, "end": float, "text": str, "speaker": "SPK1"}
+        Формат:
+          <цветной маркер> SPK1  [HH:MM:SS–HH:MM:SS]
+          текст...
         """
         try:
             doc = self._base_doc(title)
 
-            # Сшиваем подряд сегменты одного и того же спикера (для читабельности)
+            # Сшиваем подряд фразы одного спикера
+            groups: List[Dict] = []
             cur_spk: Optional[str] = None
             acc_lines: List[str] = []
             span_start: Optional[float] = None
@@ -124,19 +151,12 @@ class DOCXGenerator:
                 nonlocal cur_spk, acc_lines, span_start, span_end
                 if not acc_lines:
                     return
-                # Заголовок спикера
-                hdr = doc.add_paragraph()
-                run = hdr.add_run(cur_spk or "SPK")
-                run.style = "SpeakerLabel"
-
-                # Метки времени к группе
-                if with_timestamps and span_start is not None and span_end is not None:
-                    hdr.add_run(f"  [{_fmt_ts(span_start)}–{_fmt_ts(span_end)}]")
-
-                # Текст группы (абзацем)
-                body = " ".join(acc_lines).strip()
-                doc.add_paragraph(body)
-                doc.add_paragraph("")  # пустая строка между группами
+                groups.append({
+                    "speaker": cur_spk or "SPK",
+                    "start": float(span_start or 0.0),
+                    "end": float(span_end or (span_start or 0.0)),
+                    "text": " ".join(acc_lines).strip()
+                })
                 acc_lines = []
                 span_start = None
                 span_end = None
@@ -155,14 +175,60 @@ class DOCXGenerator:
                     span_start = s0
                     span_end = e0
                 else:
-                    # тот же спикер — расширяем временной диапазон
                     if span_start is None:
                         span_start = s0
                     span_end = e0
-
                 acc_lines.append(txt)
-
             flush()
+
+            # Карта цветов спикеров по порядку появления
+            speaker_order = []
+            color_map: Dict[str, RGBColor] = {}
+            for g in groups:
+                spk = g["speaker"]
+                if spk not in color_map:
+                    speaker_order.append(spk)
+                    color_map[spk] = PALETTE[(len(color_map)) % len(PALETTE)]
+
+            # Легенда
+            if show_legend and color_map:
+                doc.add_paragraph("")  # отступ
+                lg = doc.add_paragraph("Спикеры:", style="Subtitle")
+                for spk in speaker_order:
+                    p = doc.add_paragraph()
+                    run_marker = p.add_run(f"{marker_char} ")
+                    run_marker.font.bold = True
+                    run_marker.font.color.rgb = color_map[spk]
+
+                    run_name = p.add_run(spk)
+                    run_name.bold = True
+
+            # Контент по группам
+            for g in groups:
+                spk = g["speaker"]
+                s0 = g["start"]
+                e0 = g["end"]
+                body = g["text"]
+
+                # Подзаголовок спикера с цветным маркером
+                hdr = doc.add_paragraph(style="SpeakerHeading")
+
+                run_marker = hdr.add_run(marker_char + " ")
+                run_marker.font.bold = True
+                run_marker.font.color.rgb = color_map.get(spk, RGBColor(0, 0, 0))
+
+                run_spk = hdr.add_run(spk)
+                run_spk.bold = True
+
+                if with_timestamps:
+                    hdr.add_run(f"  [{_fmt_ts(s0)}–{_fmt_ts(e0)}]")
+
+                # Текст группы — обычным абзацем
+                # Сохраним переносы, если вдруг в тексте носители \n
+                for i, line in enumerate(body.split("\n")):
+                    doc.add_paragraph(line.strip())
+                doc.add_paragraph("")  # пустая строка между блоками
+
             doc.save(output_path)
             return True
         except Exception as e:
