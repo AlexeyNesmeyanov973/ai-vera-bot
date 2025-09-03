@@ -109,7 +109,6 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
     
 def _translation_keyboard() -> InlineKeyboardMarkup:
-    # Пары (код_языка, подпись)
     options = [
         ("ru", "На русский 🇷🇺"),
         ("en", "На английский 🇬🇧"),
@@ -120,11 +119,13 @@ def _translation_keyboard() -> InlineKeyboardMarkup:
     for i in range(0, len(options), 2):
         row = []
         for code, label in options[i:i+2]:
-            InlineKeyboardButton(f"➡️ {label}", callback_data=f"trans:{code}")
-            for code, label in options[i:i+2]
-        ]
+            row.append(InlineKeyboardButton(f"➡️ {label}", callback_data=f"trans:{code}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows)
+
+def _priority_badge(is_pro: bool) -> str:
+    return "⚡ Высокий (PRO)" if is_pro else "Обычный"
+
 
 
 # ---------- Быстрый предчек размера TG-файлов ----------
@@ -165,30 +166,41 @@ async def _reject_if_too_big(update: Update, file_type: str) -> bool:
 
 # ---------- Команды ----------
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = (
-        f"Привет, {user.first_name}! 👋\n\n"
-        "Я — AI-Vera. Быстро превращаю аудио и видео в текст.\n\n"
-        "Что делать:\n"
-        f"1) Пришли голосовое/аудио/видео (до {MAX_FILE_SIZE_MB} МБ)\n"
-        "   — поддерживаю MP3/WAV/OGG/M4A/MP4 и др.\n"
-        f"2) Или отправь ссылку на YouTube, Яндекс.Диск или Google Drive (до {URL_MAX_FILE_SIZE_MB} МБ)\n\n"
-        "Полезное:\n"
-        "• ⏱ /stats — лимиты и докупка минут\n"
-        "• ℹ️ /help — подсказки и форматы\n"
-        "• 💎 /premium — перейти на PRO\n\n"
-        "Готов? Выбери действие в меню ниже или просто пришли файл/ссылку."
-    )
-    await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
-
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = limit_manager.get_usage_info(user_id)
+    is_pro = storage.is_pro(user_id)
 
-    # Кнопки докупки минут на сегодня (фиксированные пакеты)
-    options = [10, 30, 60]
+    # Базовый текст лимитов из менеджера
+    base_text = limit_manager.get_usage_info(user_id)
+
+    # Статус очереди
+    q = task_queue.get_queue_stats()
+    queue_line = (
+        f"Текущая очередь: {q['queue_size']} | "
+        f"Активных: {q['active_tasks']}/{q['max_concurrent']}"
+    )
+
+    # Приоритет обслуживания
+    prio_line = f"Приоритет обслуживания: {_priority_badge(is_pro)}"
+
+    text = f"{base_text}\n\n{prio_line}\n{queue_line}"
+
+    # Кнопки:
+    #  - для всех: докупить минуты (как было)
+    #  - для НЕ PRO (если настроен провайдер): кнопка «⚡ Ускорить с PRO»
     rows = []
+
+    # PRO апгрейд (если доступен провайдер)
+    if not is_pro and payment_manager:
+        try:
+            payment_url = payment_manager.get_payment_url(user_id)
+            rows.append([InlineKeyboardButton("⚡ Ускорить с PRO", url=payment_url)])
+        except Exception:
+            # молча пропускаем, если провайдер не готов
+            pass
+
+    # Докупить минуты на сегодня
+    options = [10, 30, 60]
     for m in options:
         amount = m * float(OVERAGE_PRICE_RUB)
         rows.append([
@@ -197,12 +209,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"buy:{m}:{int(amount)}"
             )
         ])
-    kb = InlineKeyboardMarkup(rows)
+
+    kb = InlineKeyboardMarkup(rows) if rows else None
 
     await update.message.reply_text(
-        text + "\n\nНужно больше минут сегодня? Докупите пакет:",
+        text + ("\n\nНужно больше минут сегодня? Докупите пакет:" if rows else ""),
         reply_markup=kb
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -335,7 +349,9 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         "segments": result.get("segments") or [],
                         "title": result.get("title") or "Транскрибация",
                         "pdf_path": result.get("pdf_path"),
+                        "detected_language": result.get("detected_language"),
                     }
+
 
                     head_lines = []
                     if result.get("title"):
@@ -343,6 +359,10 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
                     dur = result.get("duration") or 0
                     head_lines.append(f"Длительность: {format_seconds(int(dur))}")
+                    
+                    # Бейдж приоритета обслуживания
+                    is_pro_now = storage.is_pro(update.effective_user.id)
+                    head_lines.append(f"Приоритет: {_priority_badge(is_pro_now)}")
 
                     if result.get("detected_language"):
                         head_lines.append(f"Язык: {_lang_pretty(result['detected_language'])}")
@@ -406,10 +426,13 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     )
                     await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
                     await update.message.reply_text("Нужен перевод текста?", reply_markup=_translation_keyboard())
-                    await update.message.reply_text("📊 Хотите посмотреть аналитику текста?", 
-                                                    reply_markup=InlineKeyboardMarkup(
-                                                        [[InlineKeyboardButton("📊 Показать аналитику", callback_data="analytics")]]
-                                                    ))
+                    await update.message.reply_text(
+                        "📊 Хотите посмотреть аналитику текста?",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("📊 Показать аналитику", callback_data="analytics")]]
+                        )
+                    )
+
 
                     await queue_msg.edit_text("✅ Готово!")
                 else:
@@ -537,16 +560,45 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Ошибка экспорта файла.")
 
 
-async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def export_translation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    kind = (query.data or "").split(":", 1)[-1]
 
-    data = context.user_data.get("last_transcription")
+    data = context.user_data.get("last_translation")
     if not data or not data.get("text"):
-        await query.edit_message_text("Нет текста для перевода.")
+        await query.edit_message_text("Нет сохранённого перевода для экспорта.")
         return
 
-    # формат: trans:<lang>
+    title = f"{data.get('title') or 'Транскрибация'} — перевод ({data.get('lang','?')})"
+    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "translation"
+    downloads = _ensure_downloads_dir()
+    filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
+
+    try:
+        if kind == "pdf":
+            pdf_path = os.path.join(downloads, f"{filename_base}.pdf")
+            pdf_generator.generate_transcription_pdf(data["text"], pdf_path, title=title)
+            with open(pdf_path, "rb") as f:
+                await query.message.reply_document(InputFile(f, filename=os.path.basename(pdf_path)),
+                                                   caption="📄 PDF перевод")
+            os.remove(pdf_path)
+
+        elif kind == "txt":
+            txt_path = os.path.join(downloads, f"{filename_base}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(data["text"])
+            with open(txt_path, "rb") as f:
+                await query.message.reply_document(InputFile(f, filename=os.path.basename(txt_path)),
+                                                   caption="📝 TXT перевод")
+            os.remove(txt_path)
+        else:
+            await query.edit_message_text("Неизвестный формат экспорта перевода.")
+    except Exception:
+        logger.exception("Export translation error")
+        await query.edit_message_text("❌ Ошибка экспорта перевода.")
+
+
     async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -570,6 +622,13 @@ async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("🌐 Выполняю перевод, подождите...")
         translated = await asyncio.to_thread(translate_text, text, target_lang, "auto")
 
+        # Сохраняем перевод для последующего экспорта
+        context.user_data["last_translation"] = {
+            "text": translated,
+            "lang": target_lang,
+            "title": title,
+        }
+
         MESSAGE_LIMIT = 3900
         lang_str = _lang_pretty(target_lang)
         head = f"🌐 *Перевод* → {lang_str}\nИз: *{title}*\n\n"
@@ -590,60 +649,41 @@ async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             os.remove(path)
 
+        # Клавиатура экспорта перевода
+        kb = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("📄 PDF перевода", callback_data="t_export:pdf"),
+                InlineKeyboardButton("📝 TXT перевода", callback_data="t_export:txt"),
+            ]]
+        )
+        await query.message.reply_text("Экспортировать перевод:", reply_markup=kb)
+
     except Exception:
         logger.exception("Translate callback error")
         await query.edit_message_text("❌ Ошибка перевода. Попробуйте позже.")
 
-    title = data.get("title") or "transcription"
-    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
-    downloads = _ensure_downloads_dir()
-    filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
+async def analytics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    try:
-        if kind == "pdf":
-            pdf_path = data.get("pdf_path")
-            if not pdf_path:
-                pdf_path = os.path.join(downloads, f"{filename_base}.pdf")
-                pdf_generator.generate_transcription_pdf(data["text"], pdf_path, title=title)
-            with open(pdf_path, "rb") as f:
-                await query.message.reply_document(
-                    InputFile(f, filename=os.path.basename(pdf_path)),
-                    caption="📄 PDF файл",
-                )
-            if not data.get("pdf_path") and os.path.exists(pdf_path):
-                os.remove(pdf_path)
+    data = context.user_data.get("last_transcription")
+    if not data or not data.get("text"):
+        await query.edit_message_text("Нет текста для аналитики.")
+        return
 
-        elif kind == "txt":
-            txt_path = os.path.join(downloads, f"{filename_base}.txt")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(data["text"])
-            with open(txt_path, "rb") as f:
-                await query.message.reply_document(
-                    InputFile(f, filename=os.path.basename(txt_path)),
-                    caption="📝 TXT файл",
-                )
-            os.remove(txt_path)
+    text = data["text"]
+    # берём язык, если сохранили в last_transcription, иначе простая эвристика
+    lang_code = data.get("detected_language")
+    if not lang_code:
+        try:
+            lang_code = "ru" if any("а" <= ch <= "я" or "А" <= ch <= "Я" for ch in text) else "en"
+        except Exception:
+            lang_code = "en"
 
-        elif kind == "srt":
-            segments = data.get("segments") or []
-            if not segments:
-                await query.edit_message_text("⏱️ Нет сегментов для SRT.")
-                return
-            srt_path = os.path.join(downloads, f"{filename_base}.srt")
-            with open(srt_path, "w", encoding="utf-8") as f:
-                f.write(_make_srt_content(segments))
-            with open(srt_path, "rb") as f:
-                await query.message.reply_document(
-                    InputFile(f, filename=os.path.basename(srt_path)),
-                    caption="⏱️ SRT файл",
-                )
-            os.remove(srt_path)
+    metrics = analyze_text(text, lang_code)
+    report = build_report_md(metrics)
+    await query.message.reply_text(report, parse_mode="Markdown")
 
-        else:
-            await query.edit_message_text("Неизвестный формат экспорта.")
-    except Exception:
-        logger.exception("Export error")
-        await query.edit_message_text("❌ Ошибка экспорта файла.")
 
 # ---------- Покупка докупки минут ----------
 
@@ -776,6 +816,9 @@ def main():
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:"))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(translate_callback, pattern=r"^trans:"))
+    app.add_handler(CallbackQueryHandler(export_translation_callback, pattern=r"^t_export:"))
+    app.add_handler(CallbackQueryHandler(analytics_callback, pattern=r"^analytics$"))
+
 
 
     logger.info("Запуск бота AI-Vera (polling)...")
