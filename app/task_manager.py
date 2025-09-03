@@ -15,7 +15,7 @@ from app.config import (
     MAX_FILE_SIZE_MB,
     URL_MAX_FILE_SIZE_MB,
 )
-from app import storage
+from app import storage  # может использоваться в расширениях
 from app.downloaders import (
     download_from_telegram,
     download_from_url,
@@ -40,6 +40,73 @@ class TranscriptionResult:
     processing_time_s: Optional[float] = None
     error: Optional[str] = None
     message: Optional[str] = None
+
+
+def _attach_speakers_to_segments(
+    segments: List[Dict],
+    diarization_turns: List[Dict],
+    default_speaker: str = "SPK",
+) -> List[Dict]:
+    """
+    Назначает каждому сегменту лучшего спикера на основе максимального перекрытия
+    с интервалами диаризации.
+    segments: [{start, end, text, ...}]
+    diarization_turns: [{start, end, speaker}, ...]
+    """
+    if not segments or not diarization_turns:
+        # проставим дефолт там, где пусто
+        for seg in segments or []:
+            seg.setdefault("speaker", default_speaker)
+        return segments
+
+    # сгруппируем интервалы диаризации по спикерам
+    diar_by_spk: Dict[str, List[tuple[float, float]]] = {}
+    for turn in diarization_turns:
+        spk = str(turn.get("speaker") or "").strip() or default_speaker
+        try:
+            ds = float(turn.get("start", 0.0))
+            de = float(turn.get("end", ds))
+        except Exception:
+            continue
+        if de < ds:
+            ds, de = de, ds
+        diar_by_spk.setdefault(spk, []).append((ds, de))
+
+    for spk in diar_by_spk:
+        diar_by_spk[spk].sort()
+
+    def _overlap(a: float, b: float, c: float, d: float) -> float:
+        lo = max(a, c)
+        hi = min(b, d)
+        return (hi - lo) if hi > lo else 0.0
+
+    for seg in segments:
+        try:
+            s0 = float(seg.get("start", 0.0))
+            e0 = float(seg.get("end", s0))
+        except Exception:
+            s0, e0 = 0.0, 0.0
+
+        txt = (seg.get("text") or "").strip()
+        if not txt:
+            seg["speaker"] = seg.get("speaker") or default_speaker
+            continue
+
+        best_spk = None
+        best_ovl = 0.0
+        for spk, ivals in diar_by_spk.items():
+            ovl = 0.0
+            for ds, de in ivals:
+                ovl += _overlap(s0, e0, ds, de)
+                if ds > e0:
+                    break
+            if ovl > best_ovl:
+                best_ovl = ovl
+                best_spk = spk
+
+        seg["speaker"] = best_spk or seg.get("speaker") or default_speaker
+
+    return segments
 
 
 class TaskManager:
@@ -81,7 +148,7 @@ class TaskManager:
         seg_time = str(max_minutes * 60)
         out_tpl = os.path.join(out_dir, "part_%03d.mp4")
 
-        # Быстрый путь: без перекодирования
+        # быстрый путь: без перекодирования
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
             "-c", "copy",
@@ -96,7 +163,7 @@ class TaskManager:
         if rc == 0 and chunked:
             return chunked
 
-        # Fallback: в WAV с разбиением
+        # fallback: в WAV с разбиением
         out_tpl = os.path.join(out_dir, "part_%03d.wav")
         cmd = [
             "ffmpeg", "-y", "-i", src_path,
@@ -142,7 +209,7 @@ class TaskManager:
                 detected_language = p.get("language") or None
 
         text_joined = "\n\n".join(full_text).strip()
-        # грубый подсчёт слов (unicode-буквы/цифры+)
+        # грубый подсчёт слов
         word_count = len([w for w in text_joined.split() if any(ch.isalnum() for ch in w)])
 
         return text_joined, all_segments, total_duration, detected_language, word_count
@@ -185,7 +252,7 @@ class TaskManager:
             except Exception:
                 media_duration = 0.0  # пойдём дальше, окончательно спишем по факту
 
-        # 2) Проверка лимитов (используем настоящую сигнатуру can_process)
+        # 2) Проверка лимитов
         ok, error_message, _, _ = limit_manager.can_process(user_id, int(media_duration) if media_duration > 0 else 0)
         if not ok:
             return {"success": False, "error": "limit_exceeded", "message": error_message or "Лимит исчерпан"}
@@ -219,40 +286,12 @@ class TaskManager:
         title = downloaded_title or per_parts[0].get("title") or "Транскрибация"
 
         # 5b) Диаризация спикеров (опционально)
-        speakers = []
         try:
             diar = diarizer.diarize(local_path)
             if diar:
-                # Присвоим каждому сегменту ближайшего по пересечению спикера
-                for seg in all_segments:
-                s0 = float(seg.get("start", 0.0))
-                e0 = float(seg.get("end", s0))
-                mid = 0.5 * (s0 + e0)
-                label = None
-
-                # 1) попадание по средине
-                for d in diar:
-                    if d["start"] <= mid <= d["end"]:
-                        label = d["speaker"]
-                        break
-
-                # 2) макс. перекрытие
-                if label is None:
-                    best_label = None
-                    best_ov = 0.0
-                    for d in diar:
-                        ov = max(0.0, min(e0, d["end"]) - max(s0, d["start"]))
-                        if ov > best_ov:
-                            best_ov = ov
-                            best_label = d["speaker"]
-                    label = best_label
-
-                if label:
-                    seg["speaker"] = label
-
-            speakers = sorted({s["speaker"] for s in all_segments if "speaker" in s})
-except Exception:
-    logger.exception("Speaker attribution failed")
+                all_segments = _attach_speakers_to_segments(all_segments, diar)
+        except Exception:
+            logger.exception("Speaker attribution failed")
 
         # 6) Списать минуты по фактической длительности
         try:
