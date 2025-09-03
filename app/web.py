@@ -1,39 +1,3 @@
-import os
-import logging
-from flask import Flask, request, jsonify, Response
-from app.bootstrap import run_startup_migrations
-
-# Prometheus
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-REQUESTS_TOTAL = Counter("web_requests_total", "Total web requests", ["endpoint", "method"])
-WEBHOOK_ERRORS_TOTAL = Counter("webhook_errors_total", "Webhook errors", ["reason"])
-WEBHOOK_LATENCY = Histogram("webhook_latency_seconds", "Webhook processing time")
-
-app = Flask(__name__)
-
-@app.before_first_request
-def _migrate_on_first_request():
-    try:
-        run_startup_migrations()
-    except Exception:
-        logger.exception("Startup migrations failed in web app")
-
-@app.before_request
-def _before_request():
-    try:
-        REQUESTS_TOTAL.labels(endpoint=request.path, method=request.method).inc()
-    except Exception:
-        pass
-
-@app.route("/metrics", methods=["GET"])
-def metrics():
-    data = generate_latest()
-    return Response(data, mimetype=CONTENT_TYPE_LATEST)
-
 @app.route("/webhook/prodamus", methods=["POST"])
 @WEBHOOK_LATENCY.time()
 def webhook_prodamus():
@@ -44,24 +8,48 @@ def webhook_prodamus():
     try:
         raw = request.get_data()
         headers = dict(request.headers)
+
+        # payment_id для логов/диагностики
+        payload_preview = request.get_json(silent=True) or {}
+        try:
+            pid = None
+            if hasattr(payment_manager, "_extract_payment_id"):
+                pid = payment_manager._extract_payment_id(payload_preview)  # да, приватный, но безопасно
+        except Exception:
+            pid = None
+
         # Prodamus требует верификацию подписи
         if hasattr(payment_manager, "verify_webhook_signature"):
-            if not payment_manager.verify_webhook_signature(raw, headers):
+            ok = payment_manager.verify_webhook_signature(raw, headers)
+            if not ok:
+                logger.warning(f"Prodamus webhook: invalid signature (pid={pid})")
                 WEBHOOK_ERRORS_TOTAL.labels(reason="bad_signature").inc()
-                return jsonify({"error": "Invalid signature"}), 401
+                return jsonify({"error": "Invalid signature", "payment_id": pid}), 401
 
-        data = request.get_json(silent=True) or {}
+        data = payload_preview
         import asyncio
         result = asyncio.run(payment_manager.handle_webhook(data))
+
+        # логируем с payment_id
         if result.get("success"):
-            return jsonify(result), 200
+            logger.info(f"Prodamus webhook OK (pid={pid}): {result.get('message')}")
+            out = dict(result)
+            if pid:
+                out["payment_id"] = pid
+            return jsonify(out), 200
         else:
+            logger.warning(f"Prodamus webhook handled with error (pid={pid}): {result}")
             WEBHOOK_ERRORS_TOTAL.labels(reason="handler_error").inc()
-            return jsonify(result), 400
+            out = dict(result)
+            if pid:
+                out["payment_id"] = pid
+            return jsonify(out), 400
+
     except Exception:
         logger.exception("Webhook error (prodamus)")
         WEBHOOK_ERRORS_TOTAL.labels(reason="exception").inc()
         return jsonify({"error": "Internal error"}), 500
+
 
 @app.route("/webhook/yookassa", methods=["POST"])
 @WEBHOOK_LATENCY.time()
@@ -71,25 +59,31 @@ def webhook_yookassa():
         WEBHOOK_ERRORS_TOTAL.labels(reason="payments_disabled").inc()
         return jsonify({"error": "Payments disabled"}), 503
     try:
-        # Для YooKassa не нужна подпись — перепроверяем по API в менеджере
         data = request.get_json(silent=True) or {}
+        # вытащим id из object.id, если есть — пригодится в логах
+        pid = None
+        try:
+            obj = data.get("object") or {}
+            pid = obj.get("id") or obj.get("payment_id")
+        except Exception:
+            pid = None
+
         import asyncio
         result = asyncio.run(payment_manager.handle_webhook(data))
         if result.get("success"):
-            return jsonify(result), 200
+            logger.info(f"YooKassa webhook OK (pid={pid}): {result.get('message')}")
+            out = dict(result)
+            if pid:
+                out["payment_id"] = pid
+            return jsonify(out), 200
         else:
+            logger.warning(f"YooKassa webhook handled with error (pid={pid}): {result}")
             WEBHOOK_ERRORS_TOTAL.labels(reason="handler_error").inc()
-            return jsonify(result), 400
+            out = dict(result)
+            if pid:
+                out["payment_id"] = pid
+            return jsonify(out), 400
     except Exception:
         logger.exception("Webhook error (yookassa)")
         WEBHOOK_ERRORS_TOTAL.labels(reason="exception").inc()
         return jsonify({"error": "Internal error"}), 500
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True})
-
-if __name__ == "__main__":
-    run_startup_migrations()
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
