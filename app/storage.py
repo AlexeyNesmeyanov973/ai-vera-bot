@@ -361,3 +361,83 @@ def consume_overage_seconds(user_id: int, consume_seconds: int):
         return
     remain = max(0, cur_extra - max(0, int(consume_seconds)))
     set_overage(user_id, remain, today)
+
+
+# ============================================================
+#                 ОБРАБОТАННЫЕ ПЛАТЕЖИ (idempotency)
+# ============================================================
+
+# В Redis храним отдельные ключи вида payproc:{provider}:{payment_id} -> "1" (TTL ~90 дней)
+# В Postgres храним таблицу processed_payments(provider, payment_id) PK
+
+# Memory fallback
+_mem_processed: set[tuple[str, str]] = set()
+
+# Инициализация таблицы для Postgres (в блоке, где создаются таблицы):
+if _pg_conn:
+    try:
+        with _pg_conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_payments (
+              provider TEXT NOT NULL,
+              payment_id TEXT NOT NULL,
+              processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (provider, payment_id)
+            );
+            """)
+    except Exception as e:
+        logger.warning(f"⚠️ Postgres processed_payments init error: {e}")
+
+def is_payment_processed(provider: str, payment_id: str) -> bool:
+    if not provider or not payment_id:
+        return False
+
+    # Redis
+    if _redis:
+        try:
+            key = f"payproc:{provider}:{payment_id}"
+            return _redis.exists(key) == 1
+        except Exception:
+            pass
+
+    # Postgres
+    if _pg_conn:
+        try:
+            with _pg_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM processed_payments WHERE provider=%s AND payment_id=%s",
+                    (provider, payment_id),
+                )
+                return cur.fetchone() is not None
+        except Exception as e:
+            logger.debug(f"Postgres is_payment_processed error: {e}")
+
+    # Memory
+    return (provider, payment_id) in _mem_processed
+
+def mark_payment_processed(provider: str, payment_id: str):
+    if not provider or not payment_id:
+        return
+
+    # Redis (TTL 90 дней)
+    if _redis:
+        try:
+            key = f"payproc:{provider}:{payment_id}"
+            _redis.set(key, "1", ex=60 * 60 * 24 * 90)
+        except Exception:
+            pass
+
+    # Postgres
+    if _pg_conn:
+        try:
+            with _pg_conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO processed_payments (provider, payment_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (provider, payment_id),
+                )
+        except Exception as e:
+            logger.debug(f"Postgres mark_payment_processed error: {e}")
+
+    # Memory
+    _mem_processed.add((provider, payment_id))
+
