@@ -50,6 +50,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+import app.task_manager as tm
+logger.info("task_manager file = %s", tm.__file__)
+
 logger = logging.getLogger(__name__)
 
 # --- Языки: код -> (Название, Флаг) ---
