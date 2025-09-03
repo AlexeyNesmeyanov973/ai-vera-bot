@@ -44,10 +44,6 @@ from app.translator import translate_text
 from app.analytics import analyze_text, build_report_md
 from app.docx_generator import docx_generator
 
-
-
-
-
 # Приглушим шум от httpx (getUpdates каждые N секунд)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -128,6 +124,33 @@ def _translation_keyboard() -> InlineKeyboardMarkup:
 def _priority_badge(is_pro: bool) -> str:
     return "⚡ Высокий (PRO)" if is_pro else "Обычный"
 
+def _docx_spk_opts(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """
+    Достаёт/создаёт настройки экспорта DOCX(спикеры) в контексте пользователя.
+    """
+    d = context.user_data.setdefault("docx_spk_opts", {"legend": True, "timestamps": True, "marker": "●"})
+    d.setdefault("legend", True)
+    d.setdefault("timestamps", True)
+    d.setdefault("marker", "●")
+    return d
+
+def _docx_spk_keyboard(opts: dict) -> InlineKeyboardMarkup:
+    legend = "✅" if opts.get("legend") else "❌"
+    ts = "✅" if opts.get("timestamps") else "❌"
+    cur = opts.get("marker", "●")
+
+    def marker_btn(ch: str):
+        sel = " ←" if cur == ch else ""
+        return InlineKeyboardButton(ch + sel, callback_data=f"docxspk:marker:{ch}")
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"Легенда: {legend}", callback_data="docxspk:toggle:legend"),
+            InlineKeyboardButton(f"Таймкоды: {ts}", callback_data="docxspk:toggle:ts"),
+        ],
+        [marker_btn("●"), marker_btn("■"), marker_btn("◆")],
+        [InlineKeyboardButton("📘 Сформировать DOCX", callback_data="docxspk:gen")],
+    ])
 
 
 # ---------- Быстрый предчек размера TG-файлов ----------
@@ -354,7 +377,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         "detected_language": result.get("detected_language"),
                     }
 
-
                     head_lines = []
                     if result.get("title"):
                         head_lines.append(f"✅ *{result['title']}*")
@@ -441,8 +463,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             [[InlineKeyboardButton("📊 Показать аналитику", callback_data="analytics")]]
                         )
                     )
-
-
                     await queue_msg.edit_text("✅ Готово!")
                 else:
                     err = result.get("error")
@@ -627,22 +647,31 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             os.remove(docx_path)
 
+        # в export_callback(...)
         elif kind == "docx_spk":
             segments = data.get("segments") or []
-            if not segments or not any(s.get("speaker") for s in segments):
-                # спикеров нет — отправим обычный DOCX
-                docx_path = os.path.join(downloads, f"{filename_base}.docx")
-                ok = docx_generator.generate_plain_docx(data["text"], docx_path, title=title)
-                if not ok:
-                    await query.edit_message_text("❌ Ошибка генерации DOCX.")
-                    return
-                with open(docx_path, "rb") as f:
-                    await query.message.reply_document(
-                        InputFile(f, filename=os.path.basename(docx_path)),
-                        caption="📘 DOCX файл",
-                    )
-                os.remove(docx_path)
+            has_speakers = any(s.get("speaker") for s in segments)
+
+            if not has_speakers:
+            # спикеров нет — мгновенно обычный DOCX
+            docx_path = os.path.join(downloads, f"{filename_base}.docx")
+            ok = docx_generator.generate_plain_docx(data["text"], docx_path, title=title)
+            if not ok:
+                await query.edit_message_text("❌ Ошибка генерации DOCX.")
                 return
+            with open(docx_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(docx_path)),
+                    caption="📘 DOCX файл",
+                )
+            os.remove(docx_path)
+            return
+
+        # спикеры есть — показываем панель настроек
+        opts = _docx_spk_opts(context)
+        await query.edit_message_text("📘 Настройки DOCX (спикеры):", reply_markup=_docx_spk_keyboard(opts))
+        return
+
 
             spk_docx_path = os.path.join(downloads, f"{filename_base}_speakers.docx")
             ok = docx_generator.generate_speaker_docx(segments, spk_docx_path, title=title, with_timestamps=True)
@@ -663,6 +692,89 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Export error")
         await query.edit_message_text("❌ Ошибка экспорта файла.")
 
+async def docxspk_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, _, key = (query.data or "").split(":", 2)  # docxspk:toggle:legend|ts
+    except Exception:
+        return
+    opts = _docx_spk_opts(context)
+    if key == "legend":
+        opts["legend"] = not opts["legend"]
+    elif key == "ts":
+        opts["timestamps"] = not opts["timestamps"]
+    # Просто обновляем клавиатуру в том же сообщении
+    await query.edit_message_reply_markup(_docx_spk_keyboard(opts))
+
+async def docxspk_marker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    marker = (query.data or "").split(":", 2)[-1]
+    if marker not in ("●", "■", "◆"):
+        marker = "●"
+    opts = _docx_spk_opts(context)
+    opts["marker"] = marker
+    await query.edit_message_reply_markup(_docx_spk_keyboard(opts))
+
+async def docxspk_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data.get("last_transcription")
+    if not data:
+        await query.edit_message_text("Нет данных для экспорта.")
+        return
+
+    title = data.get("title") or "Транскрибация"
+    downloads = _ensure_downloads_dir()
+    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+    filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
+
+    segments = data.get("segments") or []
+    opts = _docx_spk_opts(context)
+
+    try:
+        if not segments or not any(s.get("speaker") for s in segments):
+            # Нет разметки — сделаем обычный DOCX
+            docx_path = os.path.join(downloads, f"{filename_base}.docx")
+            ok = docx_generator.generate_plain_docx(data.get("text", ""), docx_path, title=title)
+            if not ok:
+                await query.edit_message_text("❌ Ошибка генерации DOCX.")
+                return
+            with open(docx_path, "rb") as f:
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(docx_path)),
+                    caption="📘 DOCX файл",
+                )
+            os.remove(docx_path)
+            await query.edit_message_text("Готово ✅")
+            return
+
+        # DOCX со спикерами по опциям
+        spk_docx_path = os.path.join(downloads, f"{filename_base}_speakers.docx")
+        ok = docx_generator.generate_speaker_docx(
+            segments=segments,
+            output_path=spk_docx_path,
+            title=title,
+            with_timestamps=bool(opts.get("timestamps", True)),
+            show_legend=bool(opts.get("legend", True)),
+            marker_char=str(opts.get("marker", "●")),
+        )
+        if not ok:
+            await query.edit_message_text("❌ Ошибка генерации DOCX со спикерами.")
+            return
+
+        with open(spk_docx_path, "rb") as f:
+            await query.message.reply_document(
+                InputFile(f, filename=os.path.basename(spk_docx_path)),
+                caption="📘 DOCX со спикерами",
+            )
+        os.remove(spk_docx_path)
+        await query.edit_message_text("Готово ✅")
+    except Exception:
+        logger.exception("docxspk_gen error")
+        await query.edit_message_text("❌ Ошибка экспорта DOCX.")
        
 async def export_translation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -922,6 +1034,9 @@ def main():
     app.add_handler(CallbackQueryHandler(translate_callback, pattern=r"^trans:"))
     app.add_handler(CallbackQueryHandler(export_translation_callback, pattern=r"^t_export:"))
     app.add_handler(CallbackQueryHandler(analytics_callback, pattern=r"^analytics$"))
+    app.add_handler(CallbackQueryHandler(docxspk_toggle, pattern=r"^docxspk:toggle:(legend|ts)$"))
+    app.add_handler(CallbackQueryHandler(docxspk_marker, pattern=r"^docxspk:marker:.+$"))
+    app.add_handler(CallbackQueryHandler(docxspk_gen, pattern=r"^docxspk:gen$"))
 
 
 
