@@ -27,3 +27,5 @@ prometheus_client==0.20.0
 
 # Платежи
 yookassa==3.0.1
+deep-translator==1.11.4
+
