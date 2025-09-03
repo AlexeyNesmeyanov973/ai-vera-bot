@@ -5,7 +5,7 @@ from typing import Optional
 from pydub import AudioSegment
 from telegram import Update
 from app.utils import get_audio_duration, get_file_size_mb
-from app.config import MAX_FILE_SIZE_MB
+from app.config import MAX_FILE_SIZE_MB, URL_MAX_FILE_SIZE_MB
 import asyncio
 import yt_dlp
 
@@ -50,6 +50,11 @@ class DownloadManager:
         return url
 
     async def download_from_url(self, url: str) -> Optional[dict]:
+        """
+        Скачивает файл по ссылке (YouTube/Я.Диск/GDrive).
+        Возвращает словарь с информацией либо None при ошибке.
+        Примечание: для ссылок применяется лимит URL_MAX_FILE_SIZE_MB.
+        """
         try:
             if self._is_google_drive_url(url):
                 url = self._normalize_google_drive_url(url)
@@ -95,9 +100,13 @@ class DownloadManager:
             duration_seconds = info.get('duration', 0)
             file_size_mb = get_file_size_mb(audio_path)
 
-            if file_size_mb > MAX_FILE_SIZE_MB:
-                os.remove(audio_path)
-                logger.warning(f"Файл с YouTube превышает лимит: {file_size_mb} МБ")
+            # лимит для ссылок
+            if file_size_mb > URL_MAX_FILE_SIZE_MB:
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
+                logger.warning(f"Файл по ссылке (YouTube) превышает лимит: {file_size_mb:.1f} МБ > {URL_MAX_FILE_SIZE_MB} МБ")
                 return None
 
             return {
@@ -132,7 +141,8 @@ class DownloadManager:
             if not os.path.exists(file_path):
                 raise Exception("Не удалось скачать файл")
 
-            if any(file_path.lower().endswith(ext) for ext in ['.mp3', '.m4a', '.mp4', '.avi', '.mov', '.webm', '.mkv', '.ogg', '.flac']):
+            # Конвертируем в WAV, если это не WAV
+            if any(file_path.lower().endswith(ext) for ext in ['.mp3', '.m4a', '.mp4', '.avi', '.mov', '.webm', '.mkv', '.ogg', '.flac', '.aac']):
                 wav_path = file_path + '.wav'
                 if self.convert_to_wav(file_path, wav_path):
                     try:
@@ -144,12 +154,13 @@ class DownloadManager:
             duration_seconds = get_audio_duration(file_path)
             file_size_mb = get_file_size_mb(file_path)
 
-            if file_size_mb > MAX_FILE_SIZE_MB:
+            # лимит для ссылок
+            if file_size_mb > URL_MAX_FILE_SIZE_MB:
                 try:
                     os.remove(file_path)
                 except Exception:
                     pass
-                logger.warning(f"Файл с облака превышает лимит: {file_size_mb} МБ")
+                logger.warning(f"Файл по ссылке (cloud) превышает лимит: {file_size_mb:.1f} МБ > {URL_MAX_FILE_SIZE_MB} МБ")
                 return None
 
             title = info.get('title') or 'Файл из облака'
@@ -170,6 +181,11 @@ class DownloadManager:
             return None
 
     async def download_file(self, update: Update, context, file_type: str) -> Optional[dict]:
+        """
+        Скачивает медиафайл, присланный непосредственно в Telegram.
+        Для таких файлов действует лимит MAX_FILE_SIZE_MB (по умолчанию 20 МБ).
+        Если превышен — отправляет пользователю понятное сообщение с подсказкой про ссылки.
+        """
         try:
             if file_type == 'voice':
                 file = update.message.voice
@@ -200,7 +216,8 @@ class DownloadManager:
                 except Exception:
                     pass
                 await update.message.reply_text(
-                    f"❌ Размер файла ({file_size_mb:.1f} МБ) превышает максимально допустимый ({MAX_FILE_SIZE_MB} МБ)."
+                    f"❌ Размер файла {file_size_mb:.1f} МБ превышает лимит {MAX_FILE_SIZE_MB} МБ для загрузок через Telegram.\n\n"
+                    f"🔗 Отправьте ссылку на файл (YouTube/Я.Диск/Google Drive) — по ссылке принимаю до {URL_MAX_FILE_SIZE_MB} МБ."
                 )
                 return None
 
