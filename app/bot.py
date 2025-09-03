@@ -2,7 +2,9 @@
 import logging
 import asyncio
 import os
+import sys
 import uuid
+from math import ceil
 
 from telegram import (
     Update,
@@ -20,7 +22,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import BadRequest
+from telegram.error import Conflict  # <— для мягкой защиты
 
 from app.config import (
     TELEGRAM_BOT_TOKEN,
@@ -37,7 +39,7 @@ from app.bootstrap import run_startup_migrations
 from app.payments_bootstrap import payment_manager
 from app.pdf_generator import pdf_generator
 
-# Приглушим шум от httpx (getUpdates)
+# Приглушим шум от httpx (getUpdates каждые N секунд)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logging.basicConfig(
@@ -46,8 +48,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- строгий импорт менеджера лимитов ---
-from app.limit_manager import limit_manager
+# --- На случай, если инстанс не экспортирован (подстраховка от ImportError) ---
+try:
+    from app.limit_manager import limit_manager
+except ImportError:
+    from app.limit_manager import LimitManager
+    limit_manager = LimitManager()
 
 
 # ---------- Вспомогательное меню ----------
@@ -61,21 +67,6 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=False,
     )
-
-
-# ---------- Утилиты ----------
-
-async def _safe_edit(msg, text: str):
-    """Безопасно редактирует сообщение очереди, чтобы не ловить 'Message is not modified'."""
-    if not msg or not text:
-        return
-    try:
-        if getattr(msg, "text", None) == text:
-            return
-        await msg.edit_text(text)
-    except BadRequest:
-        # Игнорируем одинаковый текст/разметку
-        pass
 
 
 # ---------- Команды ----------
@@ -125,8 +116,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Как использовать AI-Vera:*\n\n"
         "• Отправьте голосовое/аудио/видео (MP3, WAV, OGG, M4A, MP4, AVI и др.)\n"
         "• Или пришлите ссылку: YouTube / Яндекс.Диск / Google Drive\n\n"
-        "⚠️ Через Telegram принимаю файлы до *20 МБ*.\n"
-        "🔗 По ссылке — до *500 МБ*.\n"
+        "*Важно:* размер файла ≤ 20 МБ.\n"
         "Используйте /stats для проверки лимитов и докупки минут.",
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
@@ -254,21 +244,9 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         "pdf_path": result.get("pdf_path"),
                     }
 
-                    # Примечание о докупленных минутах (если task_manager вернул эти поля)
-                    over_note = ""
-                    if (result.get("overage_cost") or 0) > 0:
-                        over_note = (
-                            f"\n💳 Доп. минуты: {int(result.get('overage_minutes', 0))} мин · "
-                            f"к оплате {float(result.get('overage_cost', 0)):.2f} ₽"
-                        )
-
                     head = ""
                     if result.get("title"):
-                        head = (
-                            f"✅ *{result['title']}*\n"
-                            f"Длительность: {format_seconds(result['duration'])}"
-                            f"{over_note}\n\n"
-                        )
+                        head = f"✅ *{result['title']}*\nДлительность: {format_seconds(result['duration'])}\n\n"
                     text = result.get("text", "")
                     if len(text) > 4000:
                         if head:
@@ -301,7 +279,7 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         except Exception as e:
                             logger.error(f"Ошибка отправки PDF: {e}")
 
-                    await _safe_edit(queue_msg, "✅ Готово!")
+                    await queue_msg.edit_text("✅ Готово!")
                 else:
                     err = result.get("error")
                     if err == "limit_exceeded":
@@ -317,29 +295,28 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                 )
                             ])
                         kb = InlineKeyboardMarkup(rows)
-                        await _safe_edit(queue_msg, result.get("message", "Превышен лимит."))
+                        await queue_msg.edit_text(result.get("message", "Превышен лимит."))
                         await update.message.reply_text("Можно докупить минуты на сегодня:", reply_markup=kb)
                     elif err == "download_failed":
-                        await _safe_edit(queue_msg, "❌ Не удалось скачать файл/ссылку.")
+                        await queue_msg.edit_text("❌ Не удалось скачать файл/ссылку.")
                     else:
-                        await _safe_edit(queue_msg, "❌ Ошибка при обработке.")
+                        await queue_msg.edit_text("❌ Ошибка при обработке.")
                 break
 
             elif s == "failed":
-                await _safe_edit(queue_msg, "❌ Ошибка при выполнении задачи.")
+                await queue_msg.edit_text("❌ Ошибка при выполнении задачи.")
                 break
 
             elif s == "processing":
                 stats = task_queue.get_queue_stats()
                 pos = stats["queue_size"] + stats["active_tasks"]
-                await _safe_edit(
-                    queue_msg,
+                await queue_msg.edit_text(
                     f"⏳ Обрабатываю... Позиция: {pos}\n"
                     f"Активных задач: {stats['active_tasks']}/{stats['max_concurrent']}"
                 )
     except Exception as e:
         logger.error(f"Ошибка очереди: {e}")
-        await _safe_edit(queue_msg, "❌ Системная ошибка.")
+        await queue_msg.edit_text("❌ Системная ошибка.")
 
 
 # ---------- Экспорт по кнопкам ----------
@@ -519,7 +496,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- Точка входа ----------
+# ---------- Точка входа с «мягкой защитой» ----------
 
 def main():
     # Миграция PRO из ENV → Redis/Postgres
@@ -560,8 +537,33 @@ def main():
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^buy:"))
 
     logger.info("Запуск бота AI-Vera (polling)...")
-    # Чуть реже опрашиваем и очищаем отложенные апдейты
-    app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=3.0, drop_pending_updates=True)
+
+    try:
+        # реже опрашиваем и очищаем отложенные апдейты на старте
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            poll_interval=3.0,
+            drop_pending_updates=True,
+        )
+    except Conflict:
+        # Мягкая защита: другой клиент уже делает getUpdates этим токеном.
+        logger.error(
+            "❌ Conflict: другого процесса бота уже делает getUpdates этим токеном. "
+            "Остановите дубликат (локальный скрипт, второй инстанс на хостинге, включённый вебхук)."
+        )
+        # Корректно завершаемся (Render перезапустит при необходимости)
+        try:
+            asyncio.run(task_queue.stop())
+        except Exception:
+            pass
+        sys.exit(0)
+    except Exception:
+        logger.exception("Критическая ошибка приложения.")
+        try:
+            asyncio.run(task_queue.stop())
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
