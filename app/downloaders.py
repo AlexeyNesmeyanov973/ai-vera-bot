@@ -1,251 +1,273 @@
+# app/downloaders.py
 import os
 import re
+import math
+import shutil
 import logging
-from typing import Optional
-from pydub import AudioSegment
-from telegram import Update
+import subprocess
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+
+import requests
+
 from app.utils import get_audio_duration, get_file_size_mb
-from app.config import MAX_FILE_SIZE_MB, URL_MAX_FILE_SIZE_MB
-import asyncio
-import yt_dlp
 
 logger = logging.getLogger(__name__)
 
+# ===== Настройки через ENV =====
+TMP_DIR = os.getenv("TMP_DIR", "downloads")
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# лимиты
+MAX_TG_FILE_MB = float(os.getenv("MAX_TG_FILE_MB", "20"))        # телеграм файлы
+MAX_URL_MB     = float(os.getenv("MAX_URL_MB", "2000"))           # ссылки: по умолчанию 2 ГБ
+SOFT_URL_MB    = float(os.getenv("SOFT_URL_MB", "2000"))          # «мягкий» лимит для HEAD/контроля при stream
+
+# потоковая закачка
+STREAM_CHUNK_MB  = float(os.getenv("STREAM_CHUNK_MB", "4"))       # размер чанка при stream, МБ
+STREAM_TIMEOUT_S = float(os.getenv("STREAM_TIMEOUT_S", "45"))     # таймаут запроса
+RESUME_DOWNLOADS = os.getenv("RESUME_DOWNLOADS", "1") == "1"      # попытка докачки (Range)
+
+# yt-dlp: тянуть bestaudio (быстрее) вместо полного видео
+YTDLP_AUDIO_ONLY = os.getenv("YTDLP_AUDIO_ONLY", "1") == "1"
+
+YOUTUBE_RX = re.compile(r"(youtube\.com|youtu\.be)", re.I)
+VK_RX      = re.compile(r"(vk\.com|vkvideo\.ru)", re.I)
+
+@dataclass
+class FileInfo:
+    file_path: str
+    duration_seconds: int
+    title: str = "Файл"
+
+
 class DownloadManager:
-    def __init__(self, download_dir: str = "downloads"):
-        self.download_dir = download_dir
-        os.makedirs(download_dir, exist_ok=True)
+    # ----------------------------- TG файлы -----------------------------
 
-    def _is_youtube_url(self, url: str) -> bool:
-        youtube_patterns = [
-            r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/',
-            r'youtube\.com/watch\?v=',
-            r'youtu\.be/'
-        ]
-        return any(re.search(pattern, url) for pattern in youtube_patterns)
+    async def download_file(self, update, context, file_type: str) -> Optional[Dict[str, Any]]:
+        """
+        Скачивает медиа из Telegram. Возвращает:
+        {'file_path': str, 'duration_seconds': int, 'title': str}
+        """
+        msg = update.message
+        file_obj = None
+        title = "Файл"
 
-    def _is_yandex_disk_url(self, url: str) -> bool:
-        return 'yadi.sk' in url or 'disk.yandex.' in url
-
-    def _is_google_drive_url(self, url: str) -> bool:
-        return 'drive.google.com' in url
-
-    def _normalize_google_drive_url(self, url: str) -> str:
-        m = re.search(r"drive\.google\.com/(?:.*?/)?file/d/([a-zA-Z0-9_-]{10,})", url)
-        if m:
-            return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-        m = re.search(r"drive\.google\.com/(?:.*)?open\?id=([a-zA-Z0-9_-]{10,})", url)
-        if m:
-            return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-        m = re.search(r"drive\.google\.com/(?:.*)?uc\?.*?[&?]id=([a-zA-Z0-9_-]{10,})", url)
-        if m:
-            return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-        return url
-
-    async def download_from_url(self, url: str) -> Optional[dict]:
         try:
-            if self._is_google_drive_url(url):
-                url = self._normalize_google_drive_url(url)
-
-            if self._is_youtube_url(url):
-                return await self._download_youtube_video(url)
-            elif self._is_yandex_disk_url(url) or self._is_google_drive_url(url):
-                return await self._download_cloud_file(url)
+            if file_type == "voice" and msg.voice:
+                file_obj = msg.voice.get_file()
+                title = (msg.voice.file_name or msg.voice.file_unique_id or "voice.ogg")
+            elif file_type == "audio" and msg.audio:
+                file_obj = msg.audio.get_file()
+                title = (msg.audio.file_name or msg.audio.file_unique_id or "audio")
+            elif file_type == "video" and msg.video:
+                file_obj = msg.video.get_file()
+                title = (msg.video.file_name or msg.video.file_unique_id or "video")
+            elif file_type == "video_note" and msg.video_note:
+                file_obj = msg.video_note.get_file()
+                title = (msg.video_note.file_unique_id or "videonote") + ".mp4"
+            elif file_type == "document" and msg.document:
+                file_obj = msg.document.get_file()
+                title = (msg.document.file_name or msg.document.file_unique_id or "document")
             else:
-                logger.warning(f"Неподдерживаемый URL: {url}")
                 return None
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке по URL {url}: {e}")
+
+            size_mb = (file_obj.file_size or 0) / (1024 * 1024)
+            if size_mb > MAX_TG_FILE_MB:
+                # больше лимита — пусть бот подсказку даст про «пришлите ссылку»
+                return None
+
+            dst = os.path.join(TMP_DIR, self._safe_name(title))
+            await file_obj.download_to_drive(dst)
+
+            duration = self._probe_duration(dst)
+            return {"file_path": dst, "duration_seconds": duration, "title": os.path.basename(dst)}
+
+        except Exception:
+            logger.exception("TG download error")
             return None
 
-    async def _download_youtube_video(self, url: str) -> Optional[dict]:
+    # --------------------------- URL / ссылки ---------------------------
+
+    async def download_from_url(self, url: str, preferred_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Скачивает по ссылке. Для YouTube — bestaudio; прочие — потоковая закачка на диск.
+        preferred_name — желаемое имя результирующего файла на диске (безопасно нормализуется).
+        """
         try:
-            size_limit_bytes = URL_MAX_FILE_SIZE_MB * 1024 * 1024
+            if YOUTUBE_RX.search(url):
+                return self._download_youtube_audio(url, preferred_name)
 
-            # Сначала только info — оценим размер
-            def _probe():
-                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    # берём лучший аудио-формат
-                    formats = sorted(
-                        [f for f in info.get('formats', []) if f.get('acodec') != 'none'],
-                        key=lambda f: f.get('abr') or 0,
-                        reverse=True
-                    )
-                    best = formats[0] if formats else None
-                    approx = (best.get('filesize') or best.get('filesize_approx') or 0) if best else 0
-                    return info, approx
-
-            info, approx_size = await asyncio.to_thread(_probe)
-            if approx_size and approx_size > size_limit_bytes:
-                logger.warning(f"YT файл слишком большой (≈{approx_size/1024/1024:.1f} МБ) > {URL_MAX_FILE_SIZE_MB} МБ")
+            if VK_RX.search(url):
+                logger.warning("Неподдерживаемый URL (VK): %s", url)
                 return None
 
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': os.path.join(self.download_dir, '%(id)s.%(ext)s'),
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav', 'preferredquality': '192'}],
-                'quiet': True,
-                'no_warnings': True,
-                # остановить скачивание, если вдруг размер вырастет
-                'max_filesize': size_limit_bytes,
-            }
+            return self._download_stream(url, preferred_name)
 
-            def _work():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    filename = ydl.prepare_filename(info)
-                    base, _ext = os.path.splitext(filename)
-                    audio_path = base + '.wav'
-                    return info, audio_path
-
-            info, audio_path = await asyncio.to_thread(_work)
-
-            if not os.path.exists(audio_path):
-                raise Exception("Не удалось скачать аудио с YouTube")
-
-            duration_seconds = info.get('duration', 0)
-            file_size_mb = get_file_size_mb(audio_path)
-            if file_size_mb > URL_MAX_FILE_SIZE_MB:
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
-                return None
-
-            return {
-                'file_path': audio_path,
-                'file_id': info['id'],
-                'duration_seconds': duration_seconds,
-                'file_size_mb': file_size_mb,
-                'file_type': 'youtube',
-                'title': info.get('title', 'YouTube видео')
-            }
-
-        except Exception as e:
-            logger.error(f"Ошибка загрузки YouTube видео: {e}")
+        except Exception:
+            logger.exception("URL download error")
             return None
 
-    async def _download_cloud_file(self, url: str) -> Optional[dict]:
+    # ---------------------------- Конверсия -----------------------------
+
+    def convert_to_wav(self, src_path: str, dst_wav_path: str) -> bool:
+        """
+        Быстрая конверсия в WAV 16k mono, только если нужно.
+        """
         try:
-            size_limit_bytes = URL_MAX_FILE_SIZE_MB * 1024 * 1024
-            ydl_opts = {
-                'outtmpl': os.path.join(self.download_dir, '%(title).80s.%(ext)s'),
-                'quiet': True,
-                'no_warnings': True,
-                'max_filesize': size_limit_bytes,
-            }
+            if src_path.lower().endswith(".wav"):
+                shutil.copyfile(src_path, dst_wav_path)
+                return True
 
-            def _work():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    file_path = ydl.prepare_filename(info)
-                    return info, file_path
-
-            info, file_path = await asyncio.to_thread(_work)
-            if not os.path.exists(file_path):
-                raise Exception("Не удалось скачать файл")
-
-            if any(file_path.lower().endswith(ext) for ext in ['.mp3', '.m4a', '.mp4', '.avi', '.mov', '.webm', '.mkv', '.ogg', '.flac', '.aac']):
-                wav_path = file_path + '.wav'
-                if self.convert_to_wav(file_path, wav_path):
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-                    file_path = wav_path
-
-            duration_seconds = get_audio_duration(file_path)
-            file_size_mb = get_file_size_mb(file_path)
-            if file_size_mb > URL_MAX_FILE_SIZE_MB:
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-                return None
-
-            title = info.get('title') or 'Файл из облака'
-            if len(title) > 100:
-                title = title[:97] + '...'
-
-            return {
-                'file_path': file_path,
-                'file_id': os.path.basename(file_path),
-                'duration_seconds': duration_seconds,
-                'file_size_mb': file_size_mb,
-                'file_type': 'cloud',
-                'title': title
-            }
-
-        except Exception as e:
-            logger.error(f"Ошибка загрузки облачного файла: {e}")
-            return None
-
-    async def download_file(self, update: Update, context, file_type: str) -> Optional[dict]:
-        try:
-            if file_type == 'voice':
-                file = update.message.voice
-            elif file_type == 'audio':
-                file = update.message.audio
-            elif file_type == 'video':
-                file = update.message.video
-            elif file_type == 'video_note':
-                file = update.message.video_note
-            elif file_type == 'document':
-                file = update.message.document
-            else:
-                await update.message.reply_text("❌ Неподдерживаемый тип файла.")
-                return None
-
-            file_obj = await file.get_file()
-            file_extension = os.path.splitext(file_obj.file_path)[1] if file_obj.file_path else '.ogg'
-            if file_type in ('voice', 'video_note'):
-                file_extension = '.ogg'
-
-            download_path = os.path.join(self.download_dir, f"{file.file_id}{file_extension}")
-            await file_obj.download_to_drive(download_path)
-
-            file_size_mb = get_file_size_mb(download_path)
-            if file_size_mb > MAX_FILE_SIZE_MB:
-                try:
-                    os.remove(download_path)
-                except Exception:
-                    pass
-                await update.message.reply_text(
-                    f"❌ Размер файла {file_size_mb:.1f} МБ превышает лимит {MAX_FILE_SIZE_MB} МБ для загрузок через Telegram.\n\n"
-                    f"🔗 Отправьте ссылку (YouTube/Я.Диск/Google Drive) — по ссылке принимаю до {URL_MAX_FILE_SIZE_MB} МБ."
-                )
-                return None
-
-            duration_seconds = get_audio_duration(download_path)
-
-            return {
-                'file_path': download_path,
-                'file_id': file.file_id,
-                'duration_seconds': duration_seconds,
-                'file_size_mb': file_size_mb,
-                'file_type': file_type
-            }
-
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке файла: {e}")
-            await update.message.reply_text("❌ Произошла ошибка при загрузке файла. Попробуйте ещё раз.")
-            return None
-
-    def convert_to_wav(self, input_path: str, output_path: str) -> bool:
-        try:
-            audio = AudioSegment.from_file(input_path)
-            audio.export(output_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+            cmd = [
+                "ffmpeg", "-nostdin", "-v", "error", "-y",
+                "-i", src_path,
+                "-vn",
+                "-ac", "1",
+                "-ar", "16000",
+                "-acodec", "pcm_s16le",
+                dst_wav_path,
+            ]
+            rc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if rc.returncode != 0:
+                logger.error("ffmpeg conversion failed: %s", rc.stderr.decode("utf-8", "ignore"))
+                return False
             return True
-        except Exception as e:
-            logger.error(f"Ошибка конвертации в WAV: {e}")
+        except Exception:
+            logger.exception("convert_to_wav error")
             return False
 
-    def cleanup_file(self, file_path: str):
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception as e:
-            logger.error(f"Ошибка при удалении файла {file_path}: {e}")
+    # ----------------------------- Утилиты -----------------------------
 
+    def cleanup_file(self, path: str):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    # --------------------------- Внутреннее ----------------------------
+
+    def _download_youtube_audio(self, url: str, preferred_name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        yt-dlp bestaudio, чтобы быстрее начать распознавание.
+        """
+        try:
+            from yt_dlp import YoutubeDL
+        except Exception as e:
+            logger.error("yt-dlp unavailable: %s", e)
+            return None
+
+        safe_name = self._safe_name(preferred_name) if preferred_name else None
+        outtmpl = os.path.join(TMP_DIR, (safe_name or "yt_%(id)s")) + ".%(ext)s"
+
+        ydl_opts = {
+            "format": "bestaudio/best" if YTDLP_AUDIO_ONLY else "best",
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}
+            ],
+            "nocheckcertificate": True,
+            "retries": 3,
+            "fragment_retries": 3,
+        }
+
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            downloaded = ydl.prepare_filename(info)
+            base, _ = os.path.splitext(downloaded)
+            candidates = [base + ".m4a", base + ".mp3", downloaded]
+            file_path = next((p for p in candidates if os.path.exists(p)), None)
+            if not file_path:
+                logger.error("yt-dlp: файл не найден после скачивания")
+                return None
+
+            if get_file_size_mb(file_path) > MAX_URL_MB:
+                self.cleanup_file(file_path)
+                return None
+
+            title = (info.get("title") or "YouTube аудио").strip()
+            duration = self._probe_duration(file_path)
+            return {"file_path": file_path, "duration_seconds": duration, "title": title}
+
+    def _download_stream(self, url: str, preferred_name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        Стримовая загрузка «как есть» (до 2 ГБ и больше — если поднимете MAX_URL_MB).
+        Поддерживает докачку (Range) при RESUME_DOWNLOADS=1.
+        """
+        # имя файла
+        name_from_url = os.path.basename(url.split("?", 1)[0]) or "download.bin"
+        safe = self._safe_name(preferred_name or name_from_url)
+        dst_path = os.path.join(TMP_DIR, safe)
+
+        # HEAD — чтобы понять примерный размер (если сервер даёт)
+        total_size = None
+        try:
+            with requests.head(url, allow_redirects=True, timeout=15) as r:
+                cl = r.headers.get("Content-Length")
+                if cl and cl.isdigit():
+                    total_size = int(cl)
+                    if (total_size / (1024 * 1024)) > SOFT_URL_MB:
+                        logger.warning("Файл по HEAD больше лимита: %.1f МБ", total_size / (1024 * 1024))
+                        return None
+        except Exception:
+            # не критично
+            pass
+
+        mode = "wb"
+        headers = {}
+        downloaded_bytes = 0
+
+        if RESUME_DOWNLOADS and os.path.exists(dst_path):
+            downloaded_bytes = os.path.getsize(dst_path)
+            if downloaded_bytes > 0:
+                headers["Range"] = f"bytes={downloaded_bytes}-"
+                mode = "ab"
+
+        chunk_size = int(STREAM_CHUNK_MB * 1024 * 1024)
+
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=STREAM_TIMEOUT_S) as r:
+                r.raise_for_status()
+                # если сервер поддержал Range — докачка; если нет — начинаем с нуля
+                if r.status_code == 200 and "Range" in headers and downloaded_bytes:
+                    # сервер игнорировал Range → перезаписываем
+                    downloaded_bytes = 0
+                    mode = "wb"
+
+                with open(dst_path, mode) as f:
+                    for chunk in r.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        # жёсткий лимит — не больше MAX_URL_MB
+                        if downloaded_bytes > MAX_URL_MB * 1024 * 1024:
+                            raise RuntimeError("file too large")
+
+        except Exception as e:
+            logger.warning("stream download failed: %s", e)
+            # оборвать частичник только если совсем крошечный; иначе оставим для повторной докачки
+            if os.path.exists(dst_path) and os.path.getsize(dst_path) < 256 * 1024:
+                os.remove(dst_path)
+            return None
+
+        duration = self._probe_duration(dst_path)
+        return {"file_path": dst_path, "duration_seconds": duration, "title": os.path.basename(dst_path)}
+
+    def _probe_duration(self, path: str) -> int:
+        try:
+            return int(get_audio_duration(path))
+        except Exception:
+            return 0
+
+    def _safe_name(self, name: str) -> str:
+        safe = "".join(c for c in (name or "") if c.isalnum() or c in " ._-").strip()
+        return safe or "file"
+
+
+# Экземпляр менеджера
 download_manager = DownloadManager()
