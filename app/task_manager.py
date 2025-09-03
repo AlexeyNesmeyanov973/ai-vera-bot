@@ -219,6 +219,12 @@ class TaskManager:
             full_text, all_segments, total_duration, detected_language = self._merge_texts(per_parts)
             title = downloaded_title or per_parts[0].get("title") or "Транскрибация"
 
+            # Подсчёт слов (грубый, но быстрый)
+            try:
+                word_count = len((full_text or "").split())
+            except Exception:
+                word_count = 0
+
             # 6) Списание по факту
             try:
                 sec = int(round(total_duration or media_duration or 0))
@@ -254,6 +260,7 @@ class TaskManager:
                 "pdf_path": pdf_path,
                 "detected_language": detected_language,
                 "processing_time_s": processing_time_s,
+                "word_count": word_count,
             }
 
         except Exception as e:
