@@ -9,9 +9,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
 # --- Системные зависимости ---
-# ffmpeg — для pydub/yt-dlp; libgomp1 — для OpenMP (ctranslate2/faster-whisper);
-# tini — аккуратный init для корректных сигналов/зомби-процессов.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+# ffmpeg — для pydub/yt-dlp
+# libgomp1 — OpenMP для ctranslate2/faster-whisper
+# tini — корректная обработка сигналов (используется в ENTRYPOINT)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libgomp1 \
+    tini \
+ && rm -rf /var/lib/apt/lists/*
 
 
 # --- Рабочая директория ---
