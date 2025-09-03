@@ -40,8 +40,10 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # === Потоковая загрузка / временные файлы (для app/downloaders.py) ===
-TMP_DIR = os.getenv("TMP_DIR", "")  # пусто -> использовать системный tmp
+# === Потоковая загрузка (для ссылок) — опционально ===
+TMP_DIR = os.getenv("TMP_DIR", "downloads")
 STREAM_CHUNK_MB = float(os.getenv("STREAM_CHUNK_MB", "4"))
 STREAM_TIMEOUT_S = int(os.getenv("STREAM_TIMEOUT_S", "45"))
 RESUME_DOWNLOADS = int(os.getenv("RESUME_DOWNLOADS", "1"))
 YTDLP_AUDIO_ONLY = int(os.getenv("YTDLP_AUDIO_ONLY", "1"))
+
