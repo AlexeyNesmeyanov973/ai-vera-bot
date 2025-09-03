@@ -4,7 +4,6 @@ import asyncio
 import os
 import sys
 import uuid
-from math import ceil
 
 from telegram import (
     Update,
@@ -122,7 +121,12 @@ def _translation_keyboard() -> InlineKeyboardMarkup:
 def _priority_badge(is_pro: bool) -> str:
     return "⚡ Высокий (PRO)" if is_pro else "Обычный"
 
+# ---------- Настройки DOCX(спикеры) ----------
+
 def _docx_spk_opts(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """
+    Достаёт/создаёт настройки экспорта DOCX(спикеры) в контексте пользователя.
+    """
     d = context.user_data.setdefault("docx_spk_opts", {"legend": True, "timestamps": True, "marker": "●"})
     d.setdefault("legend", True)
     d.setdefault("timestamps", True)
@@ -147,7 +151,6 @@ def _docx_spk_keyboard(opts: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📘 Сформировать DOCX", callback_data="docxspk:gen")],
     ])
 
-
 # ---------- Быстрый предчек размера TG-файлов ----------
 
 def _get_tg_file_size_mb(update: Update, file_type: str) -> float | None:
@@ -168,6 +171,10 @@ def _get_tg_file_size_mb(update: Update, file_type: str) -> float | None:
     return None
 
 async def _reject_if_too_big(update: Update, file_type: str) -> bool:
+    """
+    Если TG-файл больше MAX_FILE_SIZE_MB — сразу просим прислать ссылку (до URL_MAX_FILE_SIZE_MB).
+    Возвращает True, если нужно прервать дальнейшую обработку.
+    """
     size_mb = _get_tg_file_size_mb(update, file_type)
     if size_mb is None:
         return False
@@ -241,12 +248,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Как использовать AI-Vera:*\n\n"
+        "🤖 Как использовать AI-Vera:\n\n"
         f"• Отправьте голосовое/аудио/видео (до {MAX_FILE_SIZE_MB} МБ) — MP3, WAV, OGG, M4A, MP4, AVI и др.\n"
         f"• Или пришлите ссылку: YouTube / Яндекс.Диск / Google Drive (до {URL_MAX_FILE_SIZE_MB} МБ)\n\n"
-        "*Подсказка:* длинные тексты бот сам отправит файлом .txt.\n"
+        "Подсказка: длинные тексты бот сам отправит файлом .txt.\n"
         "Используйте /stats для проверки лимитов и докупки минут.",
-        parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
     )
 
@@ -263,13 +269,12 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     payment_url = payment_manager.get_payment_url(user_id)
     await update.message.reply_text(
-        "💎 *Перейдите на PRO версию!*\n\n"
+        "💎 Перейдите на PRO версию!\n\n"
         "Преимущества:\n"
-        "• 🕐 больше минут в день\n"
-        "• ⚡ приоритет обработки\n"
-        "• 📁 все форматы\n\n"
-        f"[Оплатить PRO]({payment_url})",
-        parse_mode="Markdown",
+        "• Больше минут в день\n"
+        "• Приоритет обработки\n"
+        "• Все форматы\n\n"
+        f"Оплатить PRO: {payment_url}",
         disable_web_page_preview=True,
         reply_markup=_main_menu_keyboard(),
     )
@@ -282,11 +287,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = task_queue.get_queue_stats()
     pro_users_count = storage.count_pro()
     await update.message.reply_text(
-        "👑 *Админ-панель*\n\n"
+        "👑 Админ-панель\n\n"
         f"PRO пользователей: {pro_users_count}\n"
         f"Задач в очереди: {stats['queue_size']}\n"
-        f"Активных задач: {stats['active_tasks']}\n",
-        parse_mode="Markdown",
+        f"Активных задач: {stats['active_tasks']}\n"
     )
 
 async def add_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -344,15 +348,70 @@ async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Модель: {WHISPER_MODEL}"
     )
 
-# ---------- Обработка через очередь ----------
+# ---------- Вспомагательные для файлов/форматов ----------
 
-# ЗАМЕНИТЕ ВЕСЬ process_via_queue НА ЭТОТ
+def _ensure_downloads_dir() -> str:
+    d = "downloads"
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _srt_time(t: float) -> str:
+    ms = int(round((t - int(t)) * 1000))
+    s = int(t) % 60
+    m = (int(t) // 60) % 60
+    h = int(t) // 3600
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def _make_srt_content(segments: list[dict]) -> str:
+    lines = []
+    for idx, seg in enumerate(segments, 1):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        text = (seg.get("text") or "").strip()
+        spk = seg.get("speaker")
+        if spk:
+            text = f"{spk}: {text}"
+        lines.append(str(idx))
+        lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+def _make_speaker_txt(segments: list[dict]) -> str:
+    out_lines = []
+    cur = None
+    acc: list[str] = []
+
+    def flush():
+        nonlocal acc, cur
+        if acc:
+            out_lines.append(f"{cur or 'SPK'}: " + " ".join(acc))
+            acc = []
+
+    for seg in segments:
+        spk = seg.get("speaker")
+        txt = (seg.get("text") or "").strip()
+        if not txt:
+            continue
+        if spk != cur:
+            flush()
+            cur = spk
+        acc.append(txt)
+    flush()
+    return "\n\n".join(out_lines).strip()
+
+def _safe_title(raw: str | None, default: str = "transcription") -> str:
+    base = (raw or default)
+    safe = "".join(c for c in base if c.isalnum() or c in " _-").strip() or default
+    return safe
+
+# ---------- Обработка через очередь ----------
 
 async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, file_type: str, url: str | None = None):
     user_id = update.effective_user.id
     is_pro = storage.is_pro(user_id)
 
-    # сначала "пустое" сообщение, потом добавим в него кнопку с task_id
+    # Ставим в очередь
     queue_msg = await update.message.reply_text(
         f"📋 Задача поставлена в очередь…\nПриоритет: {_priority_badge(is_pro)}"
     )
@@ -364,7 +423,7 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             priority=priority
         )
 
-        # добавим кнопку отмены
+        # Кнопка отмены
         try:
             cancel_kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🚫 Отменить", callback_data=f"cancel:{task_id}")]]
@@ -377,10 +436,11 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await asyncio.sleep(2)
             status = task_queue.get_task_status(task_id)
             s = status.get("status")
+
             if s == "completed":
-                # уберём кнопки с сообщения очереди
+                # Уберём кнопку
                 try:
-                    await queue_msg.edit_reply_markup(None)
+                    await queue_msg.edit_reply_markup(reply_markup=None)
                 except Exception:
                     pass
 
@@ -396,29 +456,25 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
                     head_lines = []
                     if result.get("title"):
-                        head_lines.append(f"✅ *{result['title']}*")
-
+                        head_lines.append(f"✅ {result['title']}")
                     dur = result.get("duration") or 0
                     head_lines.append(f"Длительность: {format_seconds(int(dur))}")
                     head_lines.append(f"Приоритет: {_priority_badge(is_pro)}")
-
                     if result.get("detected_language"):
                         head_lines.append(f"Язык: {_lang_pretty(result['detected_language'])}")
-
                     if isinstance(result.get("word_count"), int) and result["word_count"] > 0:
                         head_lines.append(f"Слов: {result['word_count']}")
-
                     if result.get("processing_time_s") is not None:
                         secs = result["processing_time_s"]
                         head_lines.append(f"Обработка: {secs:.1f} c")
 
-                    head = "\n".join(head_lines) + "\n\n"
+                    head = "\n".join(head_lines)
 
                     text = result.get("text", "") or ""
                     MESSAGE_LIMIT = 3900
                     if len(text) > MESSAGE_LIMIT:
                         if head:
-                            await update.message.reply_text(head, parse_mode="Markdown")
+                            await update.message.reply_text(head)
                         await update.message.reply_text("📝 Текст длинный — отправляю файлом .txt")
 
                         downloads = _ensure_downloads_dir()
@@ -443,8 +499,9 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             except Exception as e:
                                 logger.error(f"Ошибка отправки PDF: {e}")
                     else:
-                        await update.message.reply_text(head + f"📝 Результат:\n\n{text}", parse_mode="Markdown")
+                        await update.message.reply_text(head + "\n\n" + "📝 Результат:\n\n" + text)
 
+                    # Инлайн-кнопки экспорта
                     keyboard = InlineKeyboardMarkup(
                         [
                             [
@@ -503,68 +560,17 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
             elif s == "processing":
                 stats = task_queue.get_queue_stats()
-                pos = stats["queue_size"] + stats["active_tasks"]
+                pos = stats["queue_size"] + stats["active_tasks"]  # оценка позиции
                 await queue_msg.edit_text(
-                    f"⏳ Обрабатываю... Позиция: {pos}\n"
-                    f"Приоритет: {_priority_badge(is_pro)}\n"
-                    f"Активных задач: {stats['active_tasks']}/{stats['max_concurrent']}"
+                    "⏳ Обрабатываю…\n"
+                    f"Позиция: {pos} | Активно: {stats['active_tasks']}/{stats['max_concurrent']}\n"
+                    f"Приоритет: {_priority_badge(is_pro)}"
                 )
     except Exception as e:
         logger.error(f"Ошибка очереди: {e}")
         await queue_msg.edit_text("❌ Системная ошибка.")
 
-
 # ---------- Экспорт по кнопкам ----------
-
-def _ensure_downloads_dir() -> str:
-    d = "downloads"
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _srt_time(t: float) -> str:
-    ms = int(round((t - int(t)) * 1000))
-    s = int(t) % 60
-    m = (int(t) // 60) % 60
-    h = int(t) // 3600
-    return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-def _make_srt_content(segments: list[dict]) -> str:
-    lines = []
-    for idx, seg in enumerate(segments, 1):
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", 0.0))
-        text = (seg.get("text") or "").strip()
-        spk = seg.get("speaker")
-        if spk:
-            text = f"{spk}: {text}"
-        lines.append(str(idx))
-        lines.append(f"{_srt_time(start)} --> {_srt_time(end)}")
-        lines.append(text)
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
-
-def _make_speaker_txt(segments: list[dict]) -> str:
-    out_lines = []
-    cur = None
-    acc: list[str] = []
-
-    def flush():
-        nonlocal acc, cur
-        if acc:
-            out_lines.append(f"{cur or 'SPK'}: " + " ".join(acc))
-            acc = []
-
-    for seg in segments:
-        spk = seg.get("speaker")
-        txt = (seg.get("text") or "").strip()
-        if not txt:
-            continue
-        if spk != cur:
-            flush()
-            cur = spk
-        acc.append(txt)
-    flush()
-    return "\n\n".join(out_lines).strip()
 
 async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -576,7 +582,7 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     title = data.get("title") or "transcription"
-    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+    safe_title = _safe_title(title)
     downloads = _ensure_downloads_dir()
     filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
 
@@ -726,7 +732,7 @@ async def docxspk_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     title = data.get("title") or "Транскрибация"
     downloads = _ensure_downloads_dir()
-    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+    safe_title = _safe_title(title)
     filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
 
     segments = data.get("segments") or []
@@ -785,7 +791,7 @@ async def export_translation_callback(update: Update, context: ContextTypes.DEFA
         return
 
     title = f"{data.get('title') or 'Транскрибация'} — перевод ({data.get('lang','?')})"
-    safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "translation"
+    safe_title = _safe_title(title, "translation")
     downloads = _ensure_downloads_dir()
     filename_base = f"{safe_title}_{uuid.uuid4().hex[:8]}"
 
@@ -794,8 +800,10 @@ async def export_translation_callback(update: Update, context: ContextTypes.DEFA
             pdf_path = os.path.join(downloads, f"{filename_base}.pdf")
             pdf_generator.generate_transcription_pdf(data["text"], pdf_path, title=title)
             with open(pdf_path, "rb") as f:
-                await query.message.reply_document(InputFile(f, filename=os.path.basename(pdf_path)),
-                                                   caption="📄 PDF перевод")
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(pdf_path)),
+                    caption="📄 PDF перевод"
+                )
             os.remove(pdf_path)
 
         elif kind == "txt":
@@ -803,8 +811,10 @@ async def export_translation_callback(update: Update, context: ContextTypes.DEFA
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(data["text"])
             with open(txt_path, "rb") as f:
-                await query.message.reply_document(InputFile(f, filename=os.path.basename(txt_path)),
-                                                   caption="📝 TXT перевод")
+                await query.message.reply_document(
+                    InputFile(f, filename=os.path.basename(txt_path)),
+                    caption="📝 TXT перевод"
+                )
             os.remove(txt_path)
         else:
             await query.edit_message_text("Неизвестный формат экспорта перевода.")
@@ -845,13 +855,14 @@ async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         MESSAGE_LIMIT = 3900
         lang_str = _lang_pretty(target_lang)
-        head = f"🌐 *Перевод* → {lang_str}\nИз: *{title}*\n\n"
+        head = f"🌐 Перевод → {lang_str}\nИз: {title}\n"
 
         if len(translated) <= MESSAGE_LIMIT:
-            await query.message.reply_text(head + translated, parse_mode="Markdown")
+            await query.message.reply_text(head)
+            await query.message.reply_text(translated)
         else:
             downloads = _ensure_downloads_dir()
-            safe_title = "".join(c for c in title if c.isalnum() or c in " _-").strip() or "transcription"
+            safe_title = _safe_title(title, "transcription")
             filename = f"translation_{safe_title}_{target_lang}_{uuid.uuid4().hex[:6]}.txt"
             path = os.path.join(downloads, filename)
             with open(path, "w", encoding="utf-8") as f:
@@ -897,8 +908,7 @@ async def analytics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     metrics = analyze_text(text, lang_code)
     report = build_report_md(metrics)
-    await query.message.reply_text(report, parse_mode="Markdown")
-
+    await query.message.reply_text(report)
 
 # ---------- Покупка докупки минут ----------
 
@@ -931,6 +941,23 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("buy_callback error")
         await query.edit_message_text("❌ Ошибка при подготовке оплаты.")
+
+# ---------- Отмена задачи ----------
+
+async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    task_id = (query.data or "").split(":", 1)[-1]
+    if not task_id:
+        await query.edit_message_text("Не удалось определить задачу для отмены.")
+        return
+
+    ok = task_queue.cancel(task_id)
+    if ok:
+        await query.edit_message_text("🚫 Задача отменена.")
+    else:
+        await query.edit_message_text("Нельзя отменить: задача уже завершена или не найдена.")
 
 # ---------- Хэндлеры сообщений (с предчеком размера) ----------
 
@@ -967,24 +994,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Пожалуйста, отправьте аудио или видео файл.", reply_markup=_main_menu_keyboard())
 
-async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    task_id = (query.data or "").split(":", 1)[-1]
-    if not task_id:
-        await query.edit_message_text("Не удалось определить задачу для отмены.")
-        return
-
-    ok = task_queue.cancel(task_id)
-    if ok:
-        await query.edit_message_text("🚫 Задача отменена.")
-    else:
-        await query.edit_message_text("Нельзя отменить: задача уже завершена или не найдена.")
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
+    # Кнопки из меню
     if text == "⏱ Статус":
         return await stats_command(update, context)
     if text == "ℹ️ Помощь":
@@ -994,6 +1007,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🔗 Отправить ссылку":
         return await update.message.reply_text("Пришлите ссылку на YouTube/Я.Диск/Google Drive одним сообщением.")
 
+    # Ссылка
     if text.startswith(("http://", "https://", "www.")):
         return await process_via_queue(update, context, "url", text)
 
@@ -1002,10 +1016,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_main_menu_keyboard()
     )
 
-
 # ---------- Точка входа с «мягкой защитой» ----------
 
 def main():
+    # Миграция PRO из ENV → Redis/Postgres
     run_startup_migrations()
 
     async def _post_init(_):
@@ -1049,16 +1063,17 @@ def main():
     app.add_handler(CallbackQueryHandler(docxspk_gen, pattern=r"^docxspk:gen$"))
     app.add_handler(CallbackQueryHandler(cancel_task_callback, pattern=r"^cancel:"))
 
-
     logger.info("Запуск бота AI-Vera (polling)...")
 
     try:
+        # реже опрашиваем и очищаем отложенные апдейты на старте
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
             poll_interval=3.0,
             drop_pending_updates=True,
         )
     except Conflict:
+        # Мягкая защита: другой процесс уже делает getUpdates этим токеном
         logger.error(
             "❌ Conflict: другой процесс бота уже делает getUpdates этим токеном. "
             "Остановите дубликат (локальный скрипт, второй инстанс на хостинге, включённый вебхук)."
