@@ -22,6 +22,7 @@ from app.downloaders import (
 )
 from app.pdf_generator import pdf_generator
 from app.utils import get_audio_duration  # для оценки длительности локального файла
+from app.diarizer import diarizer
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,42 @@ class TaskManager:
         # 5) Склейка результатов + метрики
         full_text, all_segments, total_duration, detected_language, word_count = self._merge_texts(per_parts)
         title = downloaded_title or per_parts[0].get("title") or "Транскрибация"
+
+        # 5b) Диаризация спикеров (опционально)
+        speakers = []
+        try:
+            diar = diarizer.diarize(local_path)
+            if diar:
+                # Присвоим каждому сегменту ближайшего по пересечению спикера
+                for seg in all_segments:
+                s0 = float(seg.get("start", 0.0))
+                e0 = float(seg.get("end", s0))
+                mid = 0.5 * (s0 + e0)
+                label = None
+
+                # 1) попадание по средине
+                for d in diar:
+                    if d["start"] <= mid <= d["end"]:
+                        label = d["speaker"]
+                        break
+
+                # 2) макс. перекрытие
+                if label is None:
+                    best_label = None
+                    best_ov = 0.0
+                    for d in diar:
+                        ov = max(0.0, min(e0, d["end"]) - max(s0, d["start"]))
+                        if ov > best_ov:
+                            best_ov = ov
+                            best_label = d["speaker"]
+                    label = best_label
+
+                if label:
+                    seg["speaker"] = label
+
+            speakers = sorted({s["speaker"] for s in all_segments if "speaker" in s})
+except Exception:
+    logger.exception("Speaker attribution failed")
 
         # 6) Списать минуты по фактической длительности
         try:
