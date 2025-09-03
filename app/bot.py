@@ -22,7 +22,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import Conflict  # <— для мягкой защиты
+from telegram.error import Conflict  # «мягкая защита» одного polling
 
 from app.config import (
     TELEGRAM_BOT_TOKEN,
@@ -30,6 +30,8 @@ from app.config import (
     WHISPER_MODEL,
     ADMIN_USER_IDS,
     OVERAGE_PRICE_RUB,
+    MAX_FILE_SIZE_MB,
+    URL_MAX_FILE_SIZE_MB,
 )
 from app import storage
 from app.utils import format_seconds
@@ -48,13 +50,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- На случай, если инстанс не экспортирован (подстраховка от ImportError) ---
+# Подстраховка, если инстанс не экспортирован (ImportError)
 try:
     from app.limit_manager import limit_manager
 except ImportError:
     from app.limit_manager import LimitManager
     limit_manager = LimitManager()
-
 
 # ---------- Вспомогательное меню ----------
 
@@ -68,6 +69,41 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=False,
     )
 
+# ---------- Быстрый предчек размера TG-файлов (до скачивания) ----------
+
+def _get_tg_file_size_mb(update: Update, file_type: str) -> float | None:
+    msg = update.message
+    try:
+        if file_type == "voice" and msg.voice:
+            return (msg.voice.file_size or 0) / (1024 * 1024)
+        if file_type == "audio" and msg.audio:
+            return (msg.audio.file_size or 0) / (1024 * 1024)
+        if file_type == "video" and msg.video:
+            return (msg.video.file_size or 0) / (1024 * 1024)
+        if file_type == "video_note" and msg.video_note:
+            return (msg.video_note.file_size or 0) / (1024 * 1024)
+        if file_type == "document" and msg.document:
+            return (msg.document.file_size or 0) / (1024 * 1024)
+    except Exception:
+        pass
+    return None
+
+async def _reject_if_too_big(update: Update, file_type: str) -> bool:
+    """
+    Если TG-файл больше MAX_FILE_SIZE_MB — сразу подсказка отправить ссылку (до URL_MAX_FILE_SIZE_MB).
+    Возвращает True, если нужно прервать дальнейшую обработку.
+    """
+    size_mb = _get_tg_file_size_mb(update, file_type)
+    if size_mb is None:
+        return False
+    if size_mb > float(MAX_FILE_SIZE_MB):
+        await update.message.reply_text(
+            f"❌ Файл больше {MAX_FILE_SIZE_MB} МБ и через Telegram не обрабатывается.\n\n"
+            f"👉 Пришлите ссылку (YouTube / Я.Диск / Google Drive) — по ссылке принимаем файлы до {URL_MAX_FILE_SIZE_MB} МБ.",
+            reply_markup=_main_menu_keyboard()
+        )
+        return True
+    return False
 
 # ---------- Команды ----------
 
@@ -75,18 +111,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (
         f"Привет, {user.first_name}! 👋\n\n"
-        "Я — AI-Vera. За пару шагов превращу аудио или видео в текст:\n\n"
-        "1) Отправь голосовое, аудио или видео (до 20 МБ)\n"
-        "   — поддерживаются MP3/WAV/OGG/M4A/MP4 и др.\n"
-        "2) Или пришли ссылку на YouTube, Яндекс.Диск или Google Drive\n\n"
+        "Я — AI-Vera. Быстро превращаю аудио и видео в текст.\n\n"
+        "Что делать:\n"
+        f"1) Пришли голосовое/аудио/видео (до {MAX_FILE_SIZE_MB} МБ)\n"
+        "   — поддерживаю MP3/WAV/OGG/M4A/MP4 и др.\n"
+        f"2) Или отправь ссылку на YouTube, Яндекс.Диск или Google Drive (до {URL_MAX_FILE_SIZE_MB} МБ)\n\n"
         "Полезное:\n"
-        "• ⏱ /stats — твои лимиты и докупка минут\n"
-        "• ℹ️ /help — форматы и подсказки\n"
+        "• ⏱ /stats — лимиты и докупка минут\n"
+        "• ℹ️ /help — подсказки и форматы\n"
         "• 💎 /premium — перейти на PRO\n\n"
         "Готов? Выбери действие в меню ниже или просто пришли файл/ссылку."
     )
     await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
-
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -96,7 +132,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     options = [10, 30, 60]
     rows = []
     for m in options:
-        amount = m * OVERAGE_PRICE_RUB
+        amount = m * float(OVERAGE_PRICE_RUB)
         rows.append([
             InlineKeyboardButton(
                 f"Докупить {m} мин — {amount:.0f} ₽",
@@ -110,24 +146,22 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb
     )
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Как использовать AI-Vera:*\n\n"
-        "• Отправьте голосовое/аудио/видео (MP3, WAV, OGG, M4A, MP4, AVI и др.)\n"
-        "• Или пришлите ссылку: YouTube / Яндекс.Диск / Google Drive\n\n"
-        "*Важно:* размер файла ≤ 20 МБ.\n"
+        f"• Отправьте голосовое/аудио/видео (до {MAX_FILE_SIZE_MB} МБ) — MP3, WAV, OGG, M4A, MP4, AVI и др.\n"
+        f"• Или пришлите ссылку: YouTube / Яндекс.Диск / Google Drive (до {URL_MAX_FILE_SIZE_MB} МБ)\n\n"
+        "*Подсказка:* длинные тексты бот сам отправит файлом .txt.\n"
         "Используйте /stats для проверки лимитов и докупки минут.",
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
     )
 
-
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if storage.is_pro(user_id):
         await update.message.reply_text(
-            "🎉 У вас уже есть PRO:\n• 120 мин/день (по умолчанию)\n• Приоритетная обработка\n• Все форматы",
+            "🎉 У вас уже есть PRO:\n• Больше минут в день\n• Приоритетная обработка\n• Все форматы",
             reply_markup=_main_menu_keyboard(),
         )
         return
@@ -147,7 +181,6 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_main_menu_keyboard(),
     )
 
-
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -162,7 +195,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Активных задач: {stats['active_tasks']}\n",
         parse_mode="Markdown",
     )
-
 
 async def add_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -179,7 +211,6 @@ async def add_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Неверный формат user_id")
 
-
 async def remove_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -195,7 +226,6 @@ async def remove_pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.message.reply_text("Неверный формат user_id")
 
-
 async def queue_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -210,7 +240,6 @@ async def queue_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• Параллельно: {stats['max_concurrent']}\n"
     )
 
-
 async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -221,7 +250,6 @@ async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Бэкенд: {WHISPER_BACKEND}\n"
         f"• Модель: {WHISPER_MODEL}"
     )
-
 
 # ---------- Обработка через очередь ----------
 
@@ -247,13 +275,40 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     head = ""
                     if result.get("title"):
                         head = f"✅ *{result['title']}*\nДлительность: {format_seconds(result['duration'])}\n\n"
-                    text = result.get("text", "")
-                    if len(text) > 4000:
+
+                    text = result.get("text", "") or ""
+                    MESSAGE_LIMIT = 3900  # запас к 4096
+                    if len(text) > MESSAGE_LIMIT:
+                        # 1) короткий анонс
                         if head:
                             await update.message.reply_text(head, parse_mode="Markdown")
-                        for i in range(0, len(text), 4000):
-                            await update.message.reply_text(text[i:i+4000])
+                        await update.message.reply_text("📝 Текст длинный — отправляю файлом .txt")
+
+                        # 2) полный текст .txt
+                        downloads = _ensure_downloads_dir()
+                        filename_base = f"transcription_{uuid.uuid4().hex[:8]}"
+                        txt_path = os.path.join(downloads, f"{filename_base}.txt")
+                        with open(txt_path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        with open(txt_path, "rb") as f:
+                            await update.message.reply_document(
+                                InputFile(f, filename=os.path.basename(txt_path)),
+                                caption="📝 Полный текст",
+                            )
+                        os.remove(txt_path)
+
+                        # 3) если есть авто-PDF — отправим
+                        if result.get("pdf_path"):
+                            try:
+                                with open(result["pdf_path"], "rb") as f:
+                                    await update.message.reply_document(
+                                        InputFile(f, filename="transcription.pdf"),
+                                        caption="📄 PDF версия",
+                                    )
+                            except Exception as e:
+                                logger.error(f"Ошибка отправки PDF: {e}")
                     else:
+                        # короткий текст — прямо в сообщении
                         await update.message.reply_text(head + f"📝 Результат:\n\n{text}", parse_mode="Markdown")
 
                     # Инлайн-кнопки экспорта
@@ -268,17 +323,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     )
                     await update.message.reply_text("Экспортировать в файл:", reply_markup=keyboard)
 
-                    # Если авто-PDF был создан — отправим его
-                    if result.get("pdf_path"):
-                        try:
-                            with open(result["pdf_path"], "rb") as f:
-                                await update.message.reply_document(
-                                    InputFile(f, filename="transcription.pdf"),
-                                    caption="📄 PDF версия транскрипции",
-                                )
-                        except Exception as e:
-                            logger.error(f"Ошибка отправки PDF: {e}")
-
                     await queue_msg.edit_text("✅ Готово!")
                 else:
                     err = result.get("error")
@@ -287,7 +331,7 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         options = [10, 30, 60]
                         rows = []
                         for m in options:
-                            amount = m * OVERAGE_PRICE_RUB
+                            amount = m * float(OVERAGE_PRICE_RUB)
                             rows.append([
                                 InlineKeyboardButton(
                                     f"Докупить {m} мин — {amount:.0f} ₽",
@@ -318,7 +362,6 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         logger.error(f"Ошибка очереди: {e}")
         await queue_msg.edit_text("❌ Системная ошибка.")
 
-
 # ---------- Экспорт по кнопкам ----------
 
 def _ensure_downloads_dir() -> str:
@@ -326,14 +369,12 @@ def _ensure_downloads_dir() -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
-
 def _srt_time(t: float) -> str:
     ms = int(round((t - int(t)) * 1000))
     s = int(t) % 60
     m = (int(t) // 60) % 60
     h = int(t) // 3600
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
 
 def _make_srt_content(segments: list[dict]) -> str:
     lines = []
@@ -346,7 +387,6 @@ def _make_srt_content(segments: list[dict]) -> str:
         lines.append(text)
         lines.append("")
     return "\n".join(lines).strip() + "\n"
-
 
 async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -408,7 +448,6 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Export error")
         await query.edit_message_text("❌ Ошибка экспорта файла.")
 
-
 # ---------- Покупка докупки минут ----------
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -442,24 +481,27 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("buy_callback error")
         await query.edit_message_text("❌ Ошибка при подготовке оплаты.")
 
-
-# ---------- Хэндлеры сообщений ----------
+# ---------- Хэндлеры сообщений (с предчеком размера) ----------
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_if_too_big(update, "voice"):
+        return
     await process_via_queue(update, context, "voice")
 
-
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_if_too_big(update, "audio"):
+        return
     await process_via_queue(update, context, "audio")
 
-
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_if_too_big(update, "video"):
+        return
     await process_via_queue(update, context, "video")
 
-
 async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _reject_if_too_big(update, "video_note"):
+        return
     await process_via_queue(update, context, "video_note")
-
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -468,10 +510,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name.endswith(ext)
         for ext in (".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".mkv")
     ):
+        if await _reject_if_too_big(update, "document"):
+            return
         await process_via_queue(update, context, "document")
     else:
         await update.message.reply_text("❌ Пожалуйста, отправьте аудио или видео файл.", reply_markup=_main_menu_keyboard())
-
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -484,7 +527,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "💎 PRO":
         return await premium_command(update, context)
     if text == "🔗 Отправить ссылку":
-        return await update.message.reply_text("Пришли ссылку на YouTube/Я.Диск/Google Drive одним сообщением.")
+        return await update.message.reply_text("Пришлите ссылку на YouTube/Я.Диск/Google Drive одним сообщением.")
 
     # Ссылка
     if text.startswith(("http://", "https://", "www.")):
@@ -494,7 +537,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Отправьте ссылку (YouTube/Я.Диск/GDrive) или медиафайл.",
         reply_markup=_main_menu_keyboard()
     )
-
 
 # ---------- Точка входа с «мягкой защитой» ----------
 
@@ -546,12 +588,11 @@ def main():
             drop_pending_updates=True,
         )
     except Conflict:
-        # Мягкая защита: другой клиент уже делает getUpdates этим токеном.
+        # Мягкая защита: другой процесс уже делает getUpdates этим токеном
         logger.error(
-            "❌ Conflict: другого процесса бота уже делает getUpdates этим токеном. "
+            "❌ Conflict: другой процесс бота уже делает getUpdates этим токеном. "
             "Остановите дубликат (локальный скрипт, второй инстанс на хостинге, включённый вебхук)."
         )
-        # Корректно завершаемся (Render перезапустит при необходимости)
         try:
             asyncio.run(task_queue.stop())
         except Exception:
@@ -564,7 +605,6 @@ def main():
         except Exception:
             pass
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
