@@ -62,7 +62,13 @@ class TaskManager:
             self._audio = audio_processor
 
     def _safe_tmpdir(self) -> str:
-        d = os.path.join(tempfile.gettempdir(), "ai_vera_jobs")
+        # уважаем TMP_DIR из конфига, если задан (fallback — системный tmp)
+        try:
+            from app.config import TMP_DIR
+        except Exception:
+            TMP_DIR = None
+        base = TMP_DIR if TMP_DIR else tempfile.gettempdir()
+        d = os.path.join(base, "ai_vera_jobs")
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -208,29 +214,19 @@ class TaskManager:
                 "message": str(e),
             }
 
-        # 2) Проверка лимитов/покупок
-        #    limit_manager.can_process должен возвращать кортеж (ok, error_message, remaining_after)
+        # 2) Проверка лимитов/покупок (предварительно — по известной длительности из TG/yt-dlp).
+        # Если длительность неизвестна (0), пропускаем пречек и спишем по факту после транскрибации.
         try:
-            ok, error_message, remaining_after = limit_manager.can_process(
-                user_id=user_id,
-                planned_duration_s=media_duration,  # оценка; если 0 — посчитаем после транскриба
-            )
-            if not ok:
-                return {
-                    "success": False,
-                    "error": "limit_exceeded",
-                    "message": error_message or "Лимит исчерпан",
-                }
-        except TypeError:
-            # обратная совместимость, если старая сигнатура
-            res = limit_manager.can_process(user_id)
-            ok = bool(res) if isinstance(res, bool) else bool(res[0])
-            if not ok:
-                return {
-                    "success": False,
-                    "error": "limit_exceeded",
-                    "message": "Лимит исчерпан",
-                }
+            if media_duration and media_duration > 0:
+                ok, msg, _remain, _deficit = limit_manager.can_process(user_id, int(media_duration))
+                if not ok:
+                    return {
+                        "success": False,
+                        "error": "limit_exceeded",
+                        "message": msg or "Лимит исчерпан",
+                    }
+        except Exception:
+            logger.exception("Ошибка проверки лимита (precheck)")
 
         # 3) Чанковать большой файл (напр. по 30 минут)
         chunks = [local_path]
@@ -262,10 +258,21 @@ class TaskManager:
         full_text, all_segments, total_duration = self._merge_texts(per_parts)
         title = downloaded_title or per_parts[0].get("title") or "Транскрибация"
 
-        # 6) Списать минуты (по факту длительности)
+        # 6) Списать минуты (по факту длительности, округляя до секунд)
         try:
             from app.limit_manager import limit_manager
-            limit_manager.apply_usage_seconds(user_id=user_id, seconds=total_duration)
+            sec = int(round(total_duration or media_duration or 0))
+            if sec > 0:
+                # если пречек не делали (media_duration == 0), то проверим постфактум
+                if not media_duration:
+                    ok, msg, _remain, _deficit = limit_manager.can_process(user_id, sec)
+                    if not ok:
+                        return {
+                            "success": False,
+                            "error": "limit_exceeded",
+                            "message": msg or "Лимит исчерпан",
+                        }
+                limit_manager.update_usage(user_id, sec)
         except Exception:
             logger.exception("Не удалось применить списание минут (apply_usage_seconds)")
 
