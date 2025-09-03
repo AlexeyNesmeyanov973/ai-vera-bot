@@ -346,24 +346,44 @@ async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Обработка через очередь ----------
 
+# ЗАМЕНИТЕ ВЕСЬ process_via_queue НА ЭТОТ
+
 async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, file_type: str, url: str | None = None):
     user_id = update.effective_user.id
     is_pro = storage.is_pro(user_id)
+
+    # сначала "пустое" сообщение, потом добавим в него кнопку с task_id
     queue_msg = await update.message.reply_text(
         f"📋 Задача поставлена в очередь…\nПриоритет: {_priority_badge(is_pro)}"
     )
     try:
-        # ВНИМАНИЕ: TaskQueue не поддерживает priority аргумент у task_func — не передаём его дальше!
+        priority = 0 if is_pro else 1
         task_id = await task_queue.add_task(
             task_manager.process_transcription_task,
             update, context, file_type, url,
+            priority=priority
         )
+
+        # добавим кнопку отмены
+        try:
+            cancel_kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚫 Отменить", callback_data=f"cancel:{task_id}")]]
+            )
+            await queue_msg.edit_reply_markup(reply_markup=cancel_kb)
+        except Exception:
+            pass
 
         while True:
             await asyncio.sleep(2)
             status = task_queue.get_task_status(task_id)
             s = status.get("status")
             if s == "completed":
+                # уберём кнопки с сообщения очереди
+                try:
+                    await queue_msg.edit_reply_markup(None)
+                except Exception:
+                    pass
+
                 result = status.get("result", {})
                 if result.get("success"):
                     context.user_data["last_transcription"] = {
@@ -473,6 +493,10 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         await queue_msg.edit_text("❌ Ошибка при обработке.")
                 break
 
+            elif s == "canceled":
+                await queue_msg.edit_text("🚫 Задача отменена.")
+                break
+
             elif s == "failed":
                 await queue_msg.edit_text("❌ Ошибка при выполнении задачи.")
                 break
@@ -488,6 +512,7 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     except Exception as e:
         logger.error(f"Ошибка очереди: {e}")
         await queue_msg.edit_text("❌ Системная ошибка.")
+
 
 # ---------- Экспорт по кнопкам ----------
 
@@ -610,6 +635,7 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(txt_path)
                 return
 
+            # Сгруппированный TXT по спикерам
             speaker_txt = _make_speaker_txt(segments)
             spk_path = os.path.join(downloads, f"{filename_base}_speakers.txt")
             with open(spk_path, "w", encoding="utf-8") as f:
@@ -619,8 +645,7 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InputFile(f, filename=os.path.basename(spk_path)),
                     caption="🗣️ TXT со спикерами",
                 )
-            if os.path.exists(spk_path):
-                os.remove(spk_path)
+            os.remove(spk_path)
 
         elif kind == "docx":
             docx_path = os.path.join(downloads, f"{filename_base}.docx")
@@ -639,7 +664,7 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             segments = data.get("segments") or []
             has_speakers = any(s.get("speaker") for s in segments)
             if not has_speakers:
-                # спикеров нет — обычный DOCX
+                # если спикеров нет — сделаем обычный DOCX
                 docx_path = os.path.join(downloads, f"{filename_base}.docx")
                 ok = docx_generator.generate_plain_docx(data["text"], docx_path, title=title)
                 if not ok:
@@ -653,7 +678,7 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(docx_path)
                 return
 
-            # спикеры есть — показываем панель опций
+            # спикеры есть — показываем панель настроек перед генерацией
             opts = _docx_spk_opts(context)
             await query.edit_message_text("📘 Настройки DOCX (спикеры):", reply_markup=_docx_spk_keyboard(opts))
             return
@@ -811,7 +836,7 @@ async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("🌐 Выполняю перевод, подождите...")
         translated = await asyncio.to_thread(translate_text, text, target_lang, "auto")
 
-        # Сохраняем перевод для последующего экспорта
+        # Сохраняем перевод для экспорта
         context.user_data["last_translation"] = {
             "text": translated,
             "lang": target_lang,
@@ -838,6 +863,7 @@ async def translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             os.remove(path)
 
+        # Клавиатура экспорта перевода
         kb = InlineKeyboardMarkup(
             [[
                 InlineKeyboardButton("📄 PDF перевода", callback_data="t_export:pdf"),
@@ -941,6 +967,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Пожалуйста, отправьте аудио или видео файл.", reply_markup=_main_menu_keyboard())
 
+async def cancel_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    task_id = (query.data or "").split(":", 1)[-1]
+    if not task_id:
+        await query.edit_message_text("Не удалось определить задачу для отмены.")
+        return
+
+    ok = task_queue.cancel(task_id)
+    if ok:
+        await query.edit_message_text("🚫 Задача отменена.")
+    else:
+        await query.edit_message_text("Нельзя отменить: задача уже завершена или не найдена.")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
@@ -1006,6 +1047,8 @@ def main():
     app.add_handler(CallbackQueryHandler(docxspk_toggle, pattern=r"^docxspk:toggle:(legend|ts)$"))
     app.add_handler(CallbackQueryHandler(docxspk_marker, pattern=r"^docxspk:marker:.+$"))
     app.add_handler(CallbackQueryHandler(docxspk_gen, pattern=r"^docxspk:gen$"))
+    app.add_handler(CallbackQueryHandler(cancel_task_callback, pattern=r"^cancel:"))
+
 
     logger.info("Запуск бота AI-Vera (polling)...")
 
