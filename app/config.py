@@ -47,3 +47,8 @@ STREAM_TIMEOUT_S = int(os.getenv("STREAM_TIMEOUT_S", "45"))
 RESUME_DOWNLOADS = int(os.getenv("RESUME_DOWNLOADS", "1"))
 YTDLP_AUDIO_ONLY = int(os.getenv("YTDLP_AUDIO_ONLY", "1"))
 
+# === Диаризация (опционально) ===
+DIARIZATION_BACKEND = os.getenv("DIARIZATION_BACKEND", "none")  # "pyannote" | "none"
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
+
+
