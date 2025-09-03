@@ -1,3 +1,4 @@
+# app/config.py
 import os
 from dotenv import load_dotenv
 
@@ -23,10 +24,14 @@ WHISPER_BACKEND = os.getenv("WHISPER_BACKEND", "faster")   # "faster" или "op
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru")     # "ru" или "auto"
 
-# === Лимиты == #
+# === Лимиты ===
 FREE_USER_DAILY_LIMIT_MINUTES = 30
-PRO_USER_DAILY_LIMIT_MINUTES = 120
+PRO_USER_DAILY_LIMIT_MINUTES = 180
 MAX_FILE_SIZE_MB = 20
+
+# === Сверх лимита (докупка) ===
+# Цена за 1 минуту сверх дневного лимита (Рубли)
+OVERAGE_PRICE_RUB = float(os.getenv("OVERAGE_PRICE_RUB", "2.0"))
 
 # === PRO пользователи (миграция при старте) ===
 PRO_USER_IDS = [int(x) for x in os.getenv("PRO_USER_IDS", "").split(",") if x.strip()]

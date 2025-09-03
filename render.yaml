@@ -40,14 +40,8 @@ services:
     name: ai-vera-bot-web
     runtime: docker
     dockerfilePath: Dockerfile
-    dockerCommand: python -m app.web
+    dockerCommand: bash -lc 'exec gunicorn -w 2 -b 0.0.0.0:${PORT:-8000} app.web:app'
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: ADMIN_USER_IDS
-        sync: false
-      - key: PRO_USER_IDS
-        sync: false
       - key: YOOKASSA_SHOP_ID
         sync: false
       - key: YOOKASSA_SECRET_KEY

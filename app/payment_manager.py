@@ -10,9 +10,11 @@ logger = logging.getLogger(__name__)
 
 class PaymentManager:
     """
-    Интеграция с Prodamus:
-    - Проверка подписи вебхука: HMAC-SHA256(raw_body, secret) == signature_header
-    - Ссылка на оплату: используем готовую ссылку и добавляем ?user_id=...
+    Prodamus:
+    - verify_webhook_signature
+    - get_payment_url (PRO)
+    - get_topup_url (докупка минут)
+    - handle_webhook: применяет PRO или докупку, если пришли метаданные
     """
 
     SIGNATURE_HEADER_CANDIDATES = [
@@ -65,6 +67,44 @@ class PaymentManager:
                 pass
         return None
 
+    def _extract_minutes(self, payload: Dict) -> int:
+        """Пытаемся найти minutes в разных местах (params/custom_fields)."""
+        paths = [
+            ("params", "minutes"),
+            ("custom_fields", "minutes"),
+            ("order", "minutes"),
+        ]
+        for p, k in paths:
+            d = payload.get(p) or {}
+            if isinstance(d, dict) and k in d:
+                try:
+                    return int(d[k])
+                except Exception:
+                    pass
+        return 0
+
+    def _append_query(self, base_url: str, extra: Dict[str, str]) -> str:
+        url = urlparse(base_url)
+        q = dict(parse_qsl(url.query, keep_blank_values=True))
+        q.update({k: str(v) for k, v in extra.items()})
+        new_query = urlencode(q)
+        return urlunparse((url.scheme, url.netloc, url.path, url.params, new_query, url.fragment))
+
+    # === PRO ===
+    def get_payment_url(self, user_id: int, amount: Optional[float] = None) -> str:
+        amt = amount if amount is not None else self.default_amount
+        if self.payment_link_base:
+            return self._append_query(self.payment_link_base, {"user_id": user_id, "amount": f"{amt:.2f}", "type": "pro"})
+        return f"https://payform.prodamus.ru/?user_id={user_id}&amount={amt:.2f}&type=pro"
+
+    # === TOPUP ===
+    def get_topup_url(self, user_id: int, minutes: int, amount: float) -> str:
+        if self.payment_link_base:
+            return self._append_query(self.payment_link_base, {
+                "user_id": user_id, "amount": f"{amount:.2f}", "type": "topup", "minutes": str(int(minutes))
+            })
+        return f"https://payform.prodamus.ru/?user_id={user_id}&amount={amount:.2f}&type=topup&minutes={int(minutes)}"
+
     async def handle_webhook(self, payload: Dict) -> Dict:
         try:
             user_id = self._extract_user_id(payload)
@@ -74,35 +114,34 @@ class PaymentManager:
             event = (payload.get("event") or "").lower()
             status = (payload.get("status") or "").lower()
 
-            paid = (status in ("success", "paid", "succeeded")) or ("paid" in event or "succeed" in event)
-            refunded = (status in ("refund", "refunded")) or ("refund" in event)
+            pay_type = ""
+            for path in ("params", "custom_fields", "order"):
+                d = payload.get(path) or {}
+                if isinstance(d, dict):
+                    pay_type = (d.get("type") or pay_type)
+            pay_type = (pay_type or "").lower()
 
+            minutes = self._extract_minutes(payload)
+
+            paid = (status in ("success", "paid", "succeeded")) or ("paid" in event or "succeed" in event)
             if paid:
+                if pay_type == "topup" and minutes > 0:
+                    storage.add_overage_seconds(user_id, minutes * 60)
+                    logger.info(f"Prodamus: user {user_id} TOPUP +{minutes}m")
+                    return {"success": True, "message": f"User {user_id} topped up {minutes}m"}
+                # default → PRO
                 storage.add_pro(user_id)
                 logger.info(f"Prodamus: user {user_id} upgraded to PRO")
                 return {"success": True, "message": f"User {user_id} upgraded to PRO"}
 
+            refunded = (status in ("refund", "refunded")) or ("refund" in event)
             if refunded:
-                storage.remove_pro(user_id)
-                logger.info(f"Prodamus: user {user_id} downgraded from PRO")
-                return {"success": True, "message": f"User {user_id} downgraded from PRO"}
+                # докупку откатывать не будем (обычно не делают), но можно реализовать при желании
+                logger.info(f"Prodamus: refund event for user {user_id}")
+                return {"success": True, "message": "refund processed (no change)"}
 
             logger.info(f"Prodamus: webhook received (no change): event={event}, status={status}")
             return {"success": True, "message": "Webhook received"}
         except Exception as e:
             logger.error(f"Prodamus webhook error: {e}")
             return {"success": False, "error": str(e)}
-
-    def _append_query(self, base_url: str, extra: Dict[str, str]) -> str:
-        url = urlparse(base_url)
-        q = dict(parse_qsl(url.query, keep_blank_values=True))
-        q.update({k: str(v) for k, v in extra.items()})
-        new_query = urlencode(q)
-        return urlunparse((url.scheme, url.netloc, url.path, url.params, new_query, url.fragment))
-
-    def get_payment_url(self, user_id: int, amount: Optional[float] = None) -> str:
-        amt = amount if amount is not None else self.default_amount
-        if self.payment_link_base:
-            return self._append_query(self.payment_link_base, {"user_id": user_id, "amount": f"{amt:.2f}"})
-        # запасной вариант, если не задана готовая ссылка
-        return f"https://payform.prodamus.ru/?user_id={user_id}&amount={amt:.2f}"

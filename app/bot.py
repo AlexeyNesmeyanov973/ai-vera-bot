@@ -1,3 +1,4 @@
+# app/bot.py
 import logging
 import asyncio
 import os
@@ -17,9 +18,9 @@ from app.task_queue import task_queue
 from app.task_manager import task_manager
 from app.utils import format_seconds
 from app import storage
-from app.config import WHISPER_BACKEND, WHISPER_MODEL, ADMIN_USER_IDS
+from app.config import WHISPER_BACKEND, WHISPER_MODEL, ADMIN_USER_IDS, OVERAGE_PRICE_RUB
 from app.bootstrap import run_startup_migrations
-from app.payments_bootstrap import payment_manager  # из нового файла
+from app.payments_bootstrap import payment_manager
 from app.pdf_generator import pdf_generator
 
 logging.basicConfig(
@@ -48,7 +49,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text(limit_manager.get_usage_info(user_id))
+    text = limit_manager.get_usage_info(user_id)
+
+    # Кнопки докупки минут на сегодня (фиксированные пакеты)
+    options = [10, 30, 60]
+    rows = []
+    for m in options:
+        amount = m * OVERAGE_PRICE_RUB
+        rows.append([InlineKeyboardButton(f"Докупить {m} мин — {amount:.0f} ₽", callback_data=f"buy:{m}:{int(amount)}")])
+    kb = InlineKeyboardMarkup(rows)
+
+    await update.message.reply_text(text + "\n\nНужно больше минут сегодня? Докупите пакет:", reply_markup=kb)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -142,7 +153,7 @@ async def queue_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• Параллельно: {stats['max_concurrent']}\n"
     )
 
-# --- Новая команда: /backend (только для админов) ---
+# --- /backend (только для админов) ---
 async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -212,7 +223,15 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 else:
                     err = result.get('error')
                     if err == 'limit_exceeded':
-                        await queue_msg.edit_text(result.get('message', 'Превышен лимит'))
+                        # Предложить фиксированные пакеты докупки минут
+                        options = [10, 30, 60]
+                        rows = []
+                        for m in options:
+                            amount = m * OVERAGE_PRICE_RUB
+                            rows.append([InlineKeyboardButton(f"Докупить {m} мин — {amount:.0f} ₽", callback_data=f"buy:{m}:{int(amount)}")])
+                        kb = InlineKeyboardMarkup(rows)
+                        await queue_msg.edit_text(result.get('message', 'Превышен лимит.'))
+                        await update.message.reply_text("Можно докупить минуты на сегодня:", reply_markup=kb)
                     elif err == 'download_failed':
                         await queue_msg.edit_text("❌ Не удалось скачать файл/ссылку.")
                     else:
@@ -311,6 +330,39 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Export error")
         await query.edit_message_text("❌ Ошибка экспорта файла.")
 
+# ---------- Покупка докупки минут ----------
+
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # формат: buy:<minutes>:<amount_int>
+    parts = (query.data or "").split(":")
+    try:
+        minutes = int(parts[1])
+        amount_int = int(parts[2])
+    except Exception:
+        await query.edit_message_text("Неверный параметр покупки.")
+        return
+
+    user_id = query.from_user.id
+    amount = float(amount_int)
+
+    if not payment_manager:
+        await query.edit_message_text("❌ Платежи недоступны.")
+        return
+
+    try:
+        if hasattr(payment_manager, "get_topup_url"):
+            topup_url = payment_manager.get_topup_url(user_id=user_id, minutes=minutes, amount=amount)
+            await query.edit_message_text(
+                f"Для докупки {minutes} мин перейдите по ссылке:\n{topup_url}"
+            )
+        else:
+            await query.edit_message_text("❌ Провайдер оплаты не поддерживает докупку минут.")
+    except Exception:
+        logger.exception("buy_callback error")
+        await query.edit_message_text("❌ Ошибка при подготовке оплаты.")
+
 # ---------- Хэндлеры ----------
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,7 +380,7 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     name = (doc.file_name or "").lower()
-    if any(name.endswith(ext) for ext in ('.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.avi', '.mov')):
+    if any(name.endswith(ext) for ext in ('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv')):
         await process_via_queue(update, context, 'document')
     else:
         await update.message.reply_text("❌ Пожалуйста, отправьте аудио или видео файл.")
@@ -346,14 +398,12 @@ def main():
     # Миграция PRO из ENV → Redis/Postgres
     run_startup_migrations()
 
-    # колбэки жизненного цикла
     async def _post_init(_):
         await task_queue.start()
 
     async def _post_shutdown(_):
         await task_queue.stop()
 
-    # билдим приложение с колбэками
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -380,6 +430,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(export_callback, pattern=r"^export:"))
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^buy:"))
 
     logger.info("Запуск бота AI-Vera (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

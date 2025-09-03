@@ -4,9 +4,10 @@ from app import storage
 
 class LimitManager:
     """
-    Управление лимитами пользователей с персистентным хранилищем (Redis/Postgres/Memory).
+    Управление лимитами с учётом докупленных секунд на сегодня.
     """
-    def _get_user_limit_seconds(self, user_id: int) -> int:
+
+    def _get_base_limit_seconds(self, user_id: int) -> int:
         daily = PRO_USER_DAILY_LIMIT_MINUTES if storage.is_pro(user_id) else FREE_USER_DAILY_LIMIT_MINUTES
         return daily * 60
 
@@ -15,32 +16,62 @@ class LimitManager:
         today = date.today()
         if last_date != today:
             storage.set_usage(user_id, 0, today)
+        # overage сбрасывается отдельной логикой в storage.add_overage_seconds / get_overage
 
-    def can_process(self, user_id: int, audio_duration_seconds: int) -> tuple[bool, str, int]:
+    def can_process(self, user_id: int, audio_duration_seconds: int) -> tuple[bool, str, int, int]:
+        """
+        Returns:
+          ok, message, remaining_base_plus_overage_seconds, deficit_seconds
+        """
         self._ensure_today(user_id)
-        limit_s = self._get_user_limit_seconds(user_id)
+        base_limit = self._get_base_limit_seconds(user_id)
         used_s, _ = storage.get_usage(user_id)
-        remaining = limit_s - used_s
-        if audio_duration_seconds > remaining:
+        extra_s, last = storage.get_overage(user_id)
+        if last != date.today():
+            extra_s = 0
+
+        remaining_total = max(0, base_limit - used_s) + max(0, extra_s)
+        if audio_duration_seconds > remaining_total:
+            deficit = audio_duration_seconds - remaining_total
             msg = (f"Превышен дневной лимит. Использовано: {used_s // 60} мин. "
-                   f"Лимит: {limit_s // 60} мин. "
-                   f"Не хватает: {(audio_duration_seconds - remaining) // 60} мин.")
-            return False, msg, remaining
-        return True, "", remaining - audio_duration_seconds
+                   f"База: {base_limit // 60} мин. "
+                   f"Докуплено: {extra_s // 60} мин. "
+                   f"Не хватает: {max(1, deficit // 60)} мин.")
+            return False, msg, remaining_total, deficit
+        return True, "", remaining_total, 0
 
     def update_usage(self, user_id: int, additional_seconds: int):
+        """
+        Сначала тратим базовый лимит, затем списываем из докупленных секунд.
+        """
         used_s, last_date = storage.get_usage(user_id)
-        storage.set_usage(user_id, used_s + additional_seconds, last_date)
+        base_limit = self._get_base_limit_seconds(user_id)
+        extra_s, last_over = storage.get_overage(user_id)
+        if last_over != date.today():
+            extra_s = 0
+
+        # сколько осталось базовых секунд
+        base_remaining = max(0, base_limit - used_s)
+
+        # часть уходит в базу, остаток — из докупленных
+        consume_from_base = min(base_remaining, additional_seconds)
+        consume_from_overage = max(0, additional_seconds - consume_from_base)
+
+        storage.set_usage(user_id, used_s + consume_from_base, last_date)
+        if consume_from_overage > 0:
+            storage.consume_overage_seconds(user_id, consume_from_overage)
 
     def get_usage_info(self, user_id: int) -> str:
         self._ensure_today(user_id)
-        limit_s = self._get_user_limit_seconds(user_id)
+        base_limit = self._get_base_limit_seconds(user_id)
         used_s, _ = storage.get_usage(user_id)
-        remaining = limit_s - used_s
+        extra_s, last = storage.get_overage(user_id)
+        if last != date.today():
+            extra_s = 0
+        remaining_total = max(0, base_limit - used_s) + max(0, extra_s)
         is_pro = storage.is_pro(user_id)
         return (f"Ваш статус: {'PRO 🤩' if is_pro else 'Бесплатный'}\n"
                 f"Использовано сегодня: {used_s // 60} мин.\n"
-                f"Осталось сегодня: {remaining // 60} мин.\n"
-                f"Общий дневной лимит: {limit_s // 60} мин.")
-
-limit_manager = LimitManager()
+                f"Докуплено на сегодня: {extra_s // 60} мин.\n"
+                f"Осталось сегодня (всего): {remaining_total // 60} мин.\n"
+                f"Базовый дневной лимит: {base_limit // 60} мин.")

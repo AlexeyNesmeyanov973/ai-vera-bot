@@ -1,45 +1,24 @@
-services:
-  - type: worker
-    name: ai-vera-bot
-    runtime: docker
-    dockerfilePath: Dockerfile
-    dockerCommand: python -m app.bot
-    envVars:
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: ADMIN_USER_IDS
-        sync: false
-      - key: PRO_USER_IDS
-        sync: false
-      - key: WHISPER_BACKEND
-        value: "faster"
-      - key: WHISPER_MODEL
-        value: "small"
-      - key: REDIS_URL
-        sync: false
-      - key: DATABASE_URL
-        sync: false
+# AI-Vera Transcribator 🤖
 
-  - type: web
-    name: ai-vera-bot-web
-    runtime: docker
-    dockerfilePath: Dockerfile
-    dockerCommand: python -m app.web
-    envVars:
-      - key: PRODAMUS_WEBHOOK_SECRET
-        sync: false
-      - key: PRODAMUS_PAYMENT_LINK
-        sync: false
-      - key: PRODAMUS_PRO_AMOUNT
-        value: "299.0"
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: ADMIN_USER_IDS
-        sync: false
-      - key: PRO_USER_IDS
-        sync: false
-      - key: REDIS_URL
-        sync: false
-      - key: DATABASE_URL
-        sync: false
-    healthCheckPath: /health
+Телеграм-бот для транскрибации аудио/видео в текст (Whisper: faster/openai), экспорт PDF/TXT/SRT, PRO через YooKassa/Prodamus.
+
+## Развёртывание на Render
+
+1. Репозиторий → Render → New + Docker.
+2. Добавьте два сервиса:
+   - **Worker**: `dockerCommand: python -m app.bot`
+   - **Web**: `dockerCommand: exec gunicorn -w 2 -b 0.0.0.0:${PORT:-8000} app.web:app`
+3. Установите переменные окружения (см. `.env.example`).
+
+## Переменные окружения
+
+Смотрите `.env.example`. Минимум для запуска:
+- `TELEGRAM_BOT_TOKEN`
+- (опционально) `YOOKASSA_*` **или** `PRODAMUS_*`
+- (опционально) `REDIS_URL`, `DATABASE_URL`
+
+## Команды бота
+
+- `/start`, `/help`, `/stats`
+- `/premium` — ссылка на оплату
+- `/admin`, `/queue`, `/backend` — для админов
