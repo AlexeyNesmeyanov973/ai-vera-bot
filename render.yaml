@@ -35,7 +35,7 @@ services:
     name: ai-vera-bot-web
     runtime: docker
     dockerfilePath: Dockerfile
-    dockerCommand: bash -lc 'exec gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} app.web:app'
+    dockerCommand: bash -lc 'exec gunicorn -w 2 -b 0.0.0.0:${PORT:-8000} app.web:app
     healthCheckPath: /health
     autoDeploy: true
     envVars:
