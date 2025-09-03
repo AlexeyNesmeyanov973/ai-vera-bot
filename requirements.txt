@@ -29,7 +29,7 @@ prometheus_client==0.20.0
 yookassa==3.0.1
 deep-translator==1.11.4
 
-# опционально
+# === Диаризация (опционально) ===
 pyannote.audio==3.1.1
 
 
