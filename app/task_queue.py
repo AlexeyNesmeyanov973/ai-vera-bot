@@ -10,10 +10,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Any, Dict, Tuple, Optional, List
 
+from prometheus_client import Counter, Gauge, Summary
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["TaskQueue", "task_queue"]
 
+# --- Prometheus metrics (lazy, без экспорта в этом модуле) ---
+_TASKS_ENQUEUED = Counter("taskqueue_enqueued_total", "Total tasks enqueued")
+_TASKS_COMPLETED = Counter("taskqueue_completed_total", "Total tasks completed")
+_TASKS_FAILED = Counter("taskqueue_failed_total", "Total tasks failed")
+_TASKS_CANCELED = Counter("taskqueue_canceled_total", "Total tasks canceled")
+_QUEUE_SIZE = Gauge("taskqueue_queue_size", "Current queued tasks")
+_ACTIVE_TASKS = Gauge("taskqueue_active_tasks", "Current active tasks")
+_TASK_DURATION = Summary("taskqueue_task_duration_seconds", "Task execution time (wall clock)")
 
 @dataclass(order=True)
 class _PQItem:
@@ -90,6 +100,12 @@ class TaskQueue:
             heapq.heappush(self._heap, item)
             heap_size = len(self._heap)
 
+        try:
+            _TASKS_ENQUEUED.inc()
+            _QUEUE_SIZE.set(heap_size)
+        except Exception:
+            pass
+
         self.task_results[task_id] = {
             "status": "queued",
             "created_at": datetime.fromtimestamp(created_ts),
@@ -112,6 +128,11 @@ class TaskQueue:
                     # ждём свободный слот
                     if len(self.active_tasks) >= self.max_concurrent_tasks:
                         await asyncio.sleep(0.05)
+                     try:
+                            _ACTIVE_TASKS.set(len(self.active_tasks))
+                            _QUEUE_SIZE.set(len(self._heap))
+                        except Exception:
+                            pass   
                         continue
 
                     # достаём из кучи следующую задачу
@@ -124,6 +145,11 @@ class TaskQueue:
 
                     if not item:
                         await asyncio.sleep(0.05)
+                        try:
+                            _ACTIVE_TASKS.set(len(self.active_tasks))
+                            _QUEUE_SIZE.set(0)
+                        except Exception:
+                            pass
                         continue
 
                     task_id = item.id
@@ -136,6 +162,11 @@ class TaskQueue:
                     coro = self._execute_task(item)
                     task = asyncio.create_task(coro)
                     self.active_tasks[task_id] = task
+                    try:
+                        _ACTIVE_TASKS.set(len(self.active_tasks))
+                        _QUEUE_SIZE.set(len(self._heap))
+                    except Exception:
+                        pass
 
                 except asyncio.CancelledError:
                     break
@@ -149,10 +180,15 @@ class TaskQueue:
         """Выполняет задачу и фиксирует итоговый статус/результат."""
         task_id = item.id
         try:
+            start = time.perf_counter()
             if item.timeout is not None and item.timeout > 0:
                 result = await asyncio.wait_for(item.func(*item.args, **item.kwargs), timeout=item.timeout)
             else:
                 result = await item.func(*item.args, **item.kwargs)
+            try:
+                _TASK_DURATION.observe(time.perf_counter() - start)
+            except Exception:
+                pass
 
             self.task_results[task_id].update({
                 "status": "completed",
@@ -161,6 +197,10 @@ class TaskQueue:
                 "error": None,
             })
             logger.info("Задача %s выполнена", task_id)
+            try:
+                _TASKS_COMPLETED.inc()
+            except Exception:
+                pass
 
         except asyncio.TimeoutError:
             self.task_results[task_id].update({
@@ -170,6 +210,10 @@ class TaskQueue:
                 "error": f"timeout({item.timeout}s)",
             })
             logger.warning("Задача %s прервана по таймауту %ss", task_id, item.timeout)
+            try:
+                _TASKS_FAILED.inc()
+            except Exception:
+                pass
         except asyncio.CancelledError:
             self.task_results[task_id].update({
                 "status": "canceled",
@@ -178,6 +222,10 @@ class TaskQueue:
                 "error": "canceled",
             })
             logger.warning("Задача %s отменена во время выполнения", task_id)
+            try:
+                _TASKS_CANCELED.inc()
+            except Exception:
+                pass
         except Exception as e:
             self.task_results[task_id].update({
                 "status": "failed",
@@ -186,8 +234,16 @@ class TaskQueue:
                 "error": str(e),
             })
             logger.error("Задача %s завершилась с ошибкой: %s", task_id, e, exc_info=True)
+            try:
+                _TASKS_FAILED.inc()
+            except Exception:
+                pass
         finally:
             self.active_tasks.pop(task_id, None)
+             try:
+                _ACTIVE_TASKS.set(len(self.active_tasks))
+            except Exception:
+                pass
 
     def get_task_status(self, task_id: str) -> Dict[str, Any]:
         """Текущий статус задачи (или {'status': 'not_found'})."""
@@ -239,6 +295,11 @@ class TaskQueue:
             self.task_results.setdefault(task_id, {})["status"] = "canceled"
             self.task_results[task_id]["completed_at"] = datetime.now()
             logger.info("Задача %s отменена (из очереди)", task_id)
+            try:
+                _QUEUE_SIZE.set(len(self._heap))
+                _TASKS_CANCELED.inc()
+            except Exception:
+                pass
             return True
 
         # 2) Если уже выполняется — отменяем asyncio.Task
@@ -246,6 +307,10 @@ class TaskQueue:
         if task and not task.done():
             task.cancel()
             logger.info("Задача %s запрошена к отмене (в работе)", task_id)
+            try:
+                _TASKS_CANCELED.inc()
+            except Exception:
+                pass
             return True
 
         return False
