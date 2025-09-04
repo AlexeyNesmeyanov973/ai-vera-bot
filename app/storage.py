@@ -731,3 +731,250 @@ def mark_tier_awarded(user_id: int, tier: int) -> None:
             logger.debug(f"Postgres mark_tier_awarded error: {e}")
     s = _mem_ref_tier_awarded.setdefault(user_id, set())
     s.add(int(tier))
+
+# ============================================================
+#                   РЕФЕРАЛКА И ВРЕМЕННЫЙ PRO
+# ============================================================
+
+# ----- Memory fallback (если нет Redis/Postgres) -----
+_mem_ref_code: dict[int, str] = {}                 # user_id -> code
+_mem_code_to_uid: dict[str, int] = {}              # code -> user_id
+_mem_ref_bound: dict[int, int] = {}                # friend_id -> referrer_id
+_mem_ref_friends: dict[int, set[int]] = {}         # referrer_id -> {friend_ids}
+_mem_ref_first_rewarded: set[int] = set()          # friend_id, который уже «принёс первую транскрибацию»
+_mem_ref_rewarded_total: dict[int, int] = {}       # referrer_id -> total завершённых «first» наград навсегда (счётчик)
+_mem_ref_rewarded_today: dict[tuple[int, date], int] = {}  # (referrer_id, today) -> count
+_mem_ref_tiers_awarded: dict[int, set[int]] = {}   # user_id -> {порог_интов}
+_mem_temp_pro_until: dict[int, date] = {}          # user_id -> date_until (включительно)
+
+def _gen_ref_code(n: int = 8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+# ---------- Реф-коды ----------
+
+def get_or_create_ref_code(user_id: int) -> str:
+    # Redis
+    if _redis:
+        try:
+            key = f"ref:code:{user_id}"
+            code = _redis.get(key)
+            if code:
+                return code
+            # генерим уникальный
+            for _ in range(20):
+                code = _gen_ref_code(8)
+                if not _redis.get(f"ref:code_to_uid:{code}"):
+                    break
+            _redis.set(key, code)
+            _redis.set(f"ref:code_to_uid:{code}", user_id)
+            return code
+        except Exception:
+            pass
+
+    # Memory
+    if user_id in _mem_ref_code:
+        return _mem_ref_code[user_id]
+    for _ in range(20):
+        code = _gen_ref_code(8)
+        if code not in _mem_code_to_uid:
+            _mem_code_to_uid[code] = user_id
+            _mem_ref_code[user_id] = code
+            return code
+    # на всякий
+    code = _gen_ref_code(10)
+    _mem_code_to_uid[code] = user_id
+    _mem_ref_code[user_id] = code
+    return code
+
+def resolve_ref_code(code: str) -> Optional[int]:
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+
+    if _redis:
+        try:
+            v = _redis.get(f"ref:code_to_uid:{code}")
+            return int(v) if v is not None else None
+        except Exception:
+            pass
+
+    return _mem_code_to_uid.get(code)
+
+# ---------- Привязка друга к рефереру ----------
+
+def get_referrer(friend_id: int) -> Optional[int]:
+    if _redis:
+        try:
+            v = _redis.get(f"ref:bound:{friend_id}")
+            return int(v) if v is not None else None
+        except Exception:
+            pass
+    return _mem_ref_bound.get(friend_id)
+
+def bind_referral(referrer_id: int, friend_id: int) -> bool:
+    if referrer_id == friend_id:
+        return False
+    if get_referrer(friend_id) is not None:
+        return False
+
+    if _redis:
+        try:
+            pipe = _redis.pipeline()
+            pipe.set(f"ref:bound:{friend_id}", referrer_id)
+            pipe.sadd(f"ref:friends:{referrer_id}", friend_id)
+            pipe.execute()
+            return True
+        except Exception:
+            pass
+
+    _mem_ref_bound[friend_id] = referrer_id
+    _mem_ref_friends.setdefault(referrer_id, set()).add(friend_id)
+    return True
+
+# ---------- Статистика ----------
+
+def get_ref_stats(user_id: int) -> dict:
+    total = 0
+    rewarded_total = 0
+
+    if _redis:
+        try:
+            total = int(_redis.scard(f"ref:friends:{user_id}") or 0)
+        except Exception:
+            total = 0
+        try:
+            rewarded_total = int(_redis.get(f"ref:rewarded_total:{user_id}") or 0)
+        except Exception:
+            rewarded_total = 0
+    else:
+        total = len(_mem_ref_friends.get(user_id, set()))
+        rewarded_total = int(_mem_ref_rewarded_total.get(user_id, 0))
+
+    return {"total": total, "rewarded": rewarded_total}
+
+# ---------- Первая награда другу (first transcription) ----------
+
+def has_first_reward(friend_id: int) -> bool:
+    if _redis:
+        try:
+            return bool(_redis.sismember("ref:first_rewarded", friend_id))
+        except Exception:
+            pass
+    return friend_id in _mem_ref_first_rewarded
+
+def mark_referral_rewarded(friend_id: int) -> None:
+    if has_first_reward(friend_id):
+        return
+    referrer_id = get_referrer(friend_id)
+    if referrer_id is None:
+        # никто не пригласил — но отметим, чтобы дважды не выдать
+        if _redis:
+            try:
+                _redis.sadd("ref:first_rewarded", friend_id)
+            except Exception:
+                pass
+        else:
+            _mem_ref_first_rewarded.add(friend_id)
+        return
+
+    today = date.today()
+
+    if _redis:
+        try:
+            pipe = _redis.pipeline()
+            pipe.sadd("ref:first_rewarded", friend_id)
+            pipe.incr(f"ref:rewarded_total:{referrer_id}")
+            pipe.incr(f"ref:rewarded_today:{referrer_id}:{today.isoformat()}")
+            pipe.execute()
+            return
+        except Exception:
+            pass
+
+    _mem_ref_first_rewarded.add(friend_id)
+    _mem_ref_rewarded_total[referrer_id] = int(_mem_ref_rewarded_total.get(referrer_id, 0)) + 1
+    key = (referrer_id, today)
+    _mem_ref_rewarded_today[key] = int(_mem_ref_rewarded_today.get(key, 0)) + 1
+
+def get_today_rewarded_count(referrer_id: int) -> int:
+    if _redis:
+        try:
+            v = _redis.get(f"ref:rewarded_today:{referrer_id}:{date.today().isoformat()}")
+            return int(v) if v is not None else 0
+        except Exception:
+            return 0
+    return int(_mem_ref_rewarded_today.get((referrer_id, date.today()), 0))
+
+# ---------- Пороги/награды ----------
+
+def is_tier_awarded(user_id: int, need_invites: int) -> bool:
+    need = int(need_invites)
+    if _redis:
+        try:
+            return bool(_redis.sismember(f"ref:tiers_awarded:{user_id}", need))
+        except Exception:
+            pass
+    return need in _mem_ref_tiers_awarded.get(user_id, set())
+
+def mark_tier_awarded(user_id: int, need_invites: int) -> None:
+    need = int(need_invites)
+    if _redis:
+        try:
+            _redis.sadd(f"ref:tiers_awarded:{user_id}", need)
+            return
+        except Exception:
+            pass
+    _mem_ref_tiers_awarded.setdefault(user_id, set()).add(need)
+
+# ---------- Временный PRO ----------
+
+def award_temp_pro_days(user_id: int, days: int) -> None:
+    days = max(0, int(days))
+    if days == 0:
+        return
+    today = date.today()
+    new_until = today + timedelta(days=days)
+
+    if _redis:
+        try:
+            key = f"temp_pro_until:{user_id}"
+            cur = _redis.get(key)
+            if cur:
+                try:
+                    cur_date = date.fromisoformat(cur)
+                    if cur_date > new_until:
+                        new_until = cur_date  # не укорачиваем
+                except Exception:
+                    pass
+            _redis.set(key, new_until.isoformat())
+            _redis.expire(key, 60 * 60 * 24 * 120)  # технический TTL ~4 мес
+            return
+        except Exception:
+            pass
+
+    cur = _mem_temp_pro_until.get(user_id)
+    if cur and cur > new_until:
+        new_until = cur
+    _mem_temp_pro_until[user_id] = new_until
+
+def get_pro_remaining_days(user_id: int) -> int:
+    today = date.today()
+    until: Optional[date] = None
+
+    if _redis:
+        try:
+            v = _redis.get(f"temp_pro_until:{user_id}")
+            if v:
+                until = date.fromisoformat(v)
+        except Exception:
+            until = None
+    else:
+        until = _mem_temp_pro_until.get(user_id)
+
+    if not until:
+        return 0
+    if until < today:
+        return 0
+    # считаем «до и включая until»
+    return (until - today).days
+
