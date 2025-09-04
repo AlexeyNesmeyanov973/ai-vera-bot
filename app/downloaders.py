@@ -1,14 +1,10 @@
 # app/downloaders.py
-# app/downloaders.py
 import asyncio
 import logging
-import math
 import os
 import re
 import uuid
-from dataclasses import dataclass
 from typing import Optional, Dict, Any
-
 import aiohttp
 
 from app.config import (
@@ -44,14 +40,32 @@ YTDLP_DOMAINS = (
     "tiktok.com",
 )
 
-def _safe_name(prefix="media") -> str:
+_CONTENT_TYPE_TO_EXT = {
+    "audio/mpeg": ".mp3",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+}
+
+
+def _safe_name(prefix: str = "media") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
 
 def _is_probably_direct(url: str) -> bool:
     low = url.lower()
-    if any(ext in low for ext in DIRECT_FILE_EXT):
-        return True
-    return False
+    return any(low.split("?", 1)[0].endswith(ext) for ext in DIRECT_FILE_EXT)
+
+
+def _sanitize_filename(name: str) -> str:
+    name = name.replace("\\", "_").replace("/", "_")
+    name = re.sub(r"[\r\n\t]", "_", name)
+    return name.strip() or _safe_name("download")
+
 
 async def _download_direct_stream(
     url: str,
@@ -60,33 +74,46 @@ async def _download_direct_stream(
     headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Потоковая докачка напрямую по URL (HTTP GET).
-    Ограничивает общий размер max_size_mb.
+    Потоковая докачка напрямую по URL (HTTP GET) с ограничением на общий размер.
     """
     os.makedirs(dest_dir, exist_ok=True)
     fname = _safe_name("download")
-    # Попробуем угадать расширение
-    ext = ".bin"
-    for e in DIRECT_FILE_EXT:
-        if url.lower().split("?")[0].endswith(e):
-            ext = e
-            break
-    out_path = os.path.join(dest_dir, fname + ext)
+    out_path = os.path.join(dest_dir, fname + ".bin")
 
-    chunk_size = int(STREAM_CHUNK_MB * 1024 * 1024)
+    chunk_size = max(1, int(STREAM_CHUNK_MB * 1024 * 1024))
     timeout = aiohttp.ClientTimeout(total=None, sock_read=STREAM_TIMEOUT_S)
     total = 0
 
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers or DEFAULT_HEADERS) as session:
+    # Пул коннектов ограничим немного, чтобы не «забить» контейнер
+    connector = aiohttp.TCPConnector(limit=8)
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers or DEFAULT_HEADERS, connector=connector) as session:
+        # HEAD — попробуем заранее понять размер (не все сервера поддерживают)
+        try:
+            async with session.head(url, allow_redirects=True) as hresp:
+                if hresp.status // 100 == 2:
+                    cl = hresp.headers.get("Content-Length")
+                    if cl and cl.isdigit():
+                        size_mb = int(cl) / (1024 * 1024)
+                        if size_mb > max_size_mb:
+                            return {"success": False, "error": f"Файл больше {max_size_mb} МБ"}
+        except Exception:
+            pass
+
         async with session.get(url) as resp:
             if resp.status != 200:
                 return {"success": False, "error": f"HTTP {resp.status}"}
-            # name from headers
+
+            # Имя файла
             cd = resp.headers.get("Content-Disposition", "")
-            m = re.search(r'filename="?([^"]+)"?', cd)
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
             if m:
-                out_name = m.group(1)
+                out_name = _sanitize_filename(m.group(1))
                 out_path = os.path.join(dest_dir, out_name)
+
+            # Расширение по content-type, если не смогли угадать
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].lower()
+            if out_path.endswith(".bin") and ctype in _CONTENT_TYPE_TO_EXT:
+                out_path = out_path[:-4] + _CONTENT_TYPE_TO_EXT[ctype]
 
             with open(out_path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(chunk_size):
@@ -108,8 +135,9 @@ async def _download_direct_stream(
         "path": out_path,
         "file_size_mb": size_mb,
         "title": os.path.basename(out_path),
-        "duration": 0.0,  # уточнится после транскриба
+        "duration": 0.0,  # уточним позднее
     }
+
 
 async def _download_with_ytdlp(
     url: str,
@@ -117,19 +145,15 @@ async def _download_with_ytdlp(
     max_size_mb: float,
 ) -> Dict[str, Any]:
     """
-    yt-dlp для платформ (YouTube, Vimeo, и т.д.).
-    Сохраняем как лучший аудио-поток (или контейнер).
+    yt-dlp для платформ (YouTube, Vimeo, SoundCloud, TikTok…).
     """
     if not _YTDLP_IMPORTED:
         return {"success": False, "error": "yt-dlp не установлен"}
 
     os.makedirs(dest_dir, exist_ok=True)
     base = os.path.join(dest_dir, _safe_name("ytdlp"))
-    # Формат — аудио-лучший (уменьшает размер)
-    ytfmt = "bestaudio/best" if str(YTDLP_AUDIO_ONLY) == "1" else "best"
+    ytfmt = "bestaudio/best" if str(YTDLP_AUDIO_ONLY) in ("1", "true", "yes") else "best"
 
-    # Ограничение размера реализуем через postprocessor args (не всегда возможно),
-    # поэтому делаем мягко: качаем, а потом проверяем вес.
     ydl_opts = {
         "outtmpl": base + ".%(ext)s",
         "format": ytfmt,
@@ -143,16 +167,13 @@ async def _download_with_ytdlp(
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
         info = ydl.extract_info(url, download=True)
         out_path = ydl.prepare_filename(info)
-        try:
-            # иногда добавляется ".webm" позже — найдём реальный файл
-            if not os.path.exists(out_path):
-                # поиск ближайшего
-                for f in os.listdir(dest_dir):
-                    if os.path.basename(out_path).split(".")[0] in f:
-                        out_path = os.path.join(dest_dir, f)
-                        break
-        except Exception:
-            pass
+        if not os.path.exists(out_path):
+            # Попробуем подобрать итоговый файл, если расширение изменилось
+            stem = os.path.basename(out_path).rsplit(".", 1)[0]
+            for f in os.listdir(dest_dir):
+                if f.startswith(stem + "."):
+                    out_path = os.path.join(dest_dir, f)
+                    break
 
     if not os.path.exists(out_path):
         return {"success": False, "error": "Не удалось сохранить файл yt-dlp"}
@@ -175,6 +196,7 @@ async def _download_with_ytdlp(
         "duration": duration,
     }
 
+
 # ---------- Публичные функции ----------
 
 async def download_from_url(url: str, dest_dir: str, max_size_mb: float) -> Dict[str, Any]:
@@ -183,30 +205,30 @@ async def download_from_url(url: str, dest_dir: str, max_size_mb: float) -> Dict
       • если похоже на прямой файл — качаем потоково (aiohttp)
       • иначе — пробуем yt-dlp
     """
-    # маленький sanity-check
     if not (url.startswith("http://") or url.startswith("https://")):
         return {"success": False, "error": "Некорректный URL"}
 
     try:
         if _is_probably_direct(url):
             return await _download_direct_stream(url, dest_dir, max_size_mb)
-        # Проверим домены, где у yt-dlp больше шансов
+
         if any(d in url for d in YTDLP_DOMAINS):
             return await _download_with_ytdlp(url, dest_dir, max_size_mb)
-        # Попытаться как прямой файл
+
+        # 1) пробуем как прямой файл
         res = await _download_direct_stream(url, dest_dir, max_size_mb)
         if res.get("success"):
             return res
-        # Фолбэк в yt-dlp
+        # 2) фолбэк в yt-dlp
         return await _download_with_ytdlp(url, dest_dir, max_size_mb)
     except Exception as e:
         logger.exception("download_from_url error")
         return {"success": False, "error": str(e)}
 
+
 async def download_from_telegram(update, context, file_type: str, dest_dir: str, max_size_mb: float) -> Dict[str, Any]:
     """
-    Скачивание из Telegram. Предполагается, что размер уже проверен в боте,
-    но тут тоже ограничим на всякий случай.
+    Скачивание из Telegram. Размер уже проверен в боте, но дубль-проверка тут тоже есть.
     """
     os.makedirs(dest_dir, exist_ok=True)
     msg = update.message
@@ -215,7 +237,6 @@ async def download_from_telegram(update, context, file_type: str, dest_dir: str,
     title = None
     size_bytes = 0
 
-    # Получаем объект файла
     if file_type == "voice" and msg.voice:
         tg_file = await msg.voice.get_file()
         size_bytes = msg.voice.file_size or 0
@@ -243,12 +264,10 @@ async def download_from_telegram(update, context, file_type: str, dest_dir: str,
     if size_mb > max_size_mb:
         return {"success": False, "error": f"Файл больше {max_size_mb} МБ"}
 
-    # Сохраняем
-    safe = title if "." in title else f"{title}.bin"
+    safe = title if "." in (title or "") else f"{title}.bin"
     out_path = os.path.join(dest_dir, f"{uuid.uuid4().hex[:8]}_{safe}")
     await tg_file.download_to_drive(custom_path=out_path)
 
-    # duration для аудио/видео из Telegram (если телега прислала)
     duration = 0.0
     if file_type == "audio" and msg.audio and msg.audio.duration:
         duration = float(msg.audio.duration)
