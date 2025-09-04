@@ -35,8 +35,8 @@ from app.config import (
     REF_ENABLED,
     REF_BONUS_MINUTES,
     REF_MAX_REWARDS_PER_REFERRER_PER_DAY,
-    REF_TIERS,            # строка с порогами из .env
-    REF_TIER_STICKERS,    # опционально
+    REF_TIERS as REF_TIERS_RAW,            # строка с порогами из .env
+    REF_TIER_STICKERS,    # опционально  строка "3:ID,5:ID,10:ID" или список
 )
 
 from datetime import date, timedelta
@@ -145,7 +145,8 @@ def _docx_spk_opts(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return d
 
 def _parse_ref_tiers(s: str) -> list[tuple[int, int]]:
-    out = []
+    """'3:1,5:3,10:7' -> [(3,1),(5,3),(10,7)]"""
+    out: list[tuple[int, int]] = []
     for part in (s or "").split(","):
         part = part.strip()
         if not part or ":" not in part:
@@ -157,6 +158,49 @@ def _parse_ref_tiers(s: str) -> list[tuple[int, int]]:
             pass
     out.sort(key=lambda x: x[0])
     return out
+
+# используем то, что импортировали: REF_TIERS as REF_TIERS_RAW
+_REF_TIERS: list[tuple[int, int]] = _parse_ref_tiers(REF_TIERS_RAW)
+
+def _parse_tier_stickers(raw) -> dict[int, str]:
+    """
+    Принимает:
+      • строку "3:ID,5:ID" ИЛИ
+      • список ["3:ID","5:ID"] ИЛИ
+      • позиционный список ["ID1","ID2"] (тогда маппит по порядку к _REF_TIERS).
+    Возвращает {need:int -> sticker_id:str}.
+    """
+    items: list[str] = []
+    if isinstance(raw, str):
+        items = [p.strip() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(p).strip() for p in raw if str(p).strip()]
+
+    mapping: dict[int, str] = {}
+    # явный формат "need:sticker"
+    for p in items:
+        if ":" in p:
+            need_s, sticker = p.split(":", 1)
+            try:
+                need = int(need_s)
+                if sticker:
+                    mapping[need] = sticker.strip()
+            except Exception:
+                pass
+    if mapping:
+        return mapping
+
+    # позиционный формат — по порядку порогов
+    for idx, p in enumerate(items):
+        if idx < len(_REF_TIERS):
+            need, _days = _REF_TIERS[idx]
+            mapping[need] = p
+    return mapping
+
+_REF_TIER_STICKERS_MAP: dict[int, str] = _parse_tier_stickers(REF_TIER_STICKERS)
+
+def _ref_sticker_for_tier(need: int) -> str | None:
+    return _REF_TIER_STICKERS_MAP.get(int(need))
 
 def _parse_sticker_map(s: str) -> dict[int, str]:
     out = {}
@@ -175,80 +219,57 @@ _REF_TIERS = _parse_ref_tiers(REF_TIERS)
 _STICKERS_BY_TIER = _parse_sticker_map(REF_TIER_STICKERS)
 
 async def _maybe_award_ref_tier(referrer_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Проверяем пороги рефералок и при необходимости:
-      - выдаём временный PRO на N дней (award_temp_pro_days | add_pro_for_days),
-      - отправляем стикер (если настроен),
-      - отправляем уведомление с остатком временного PRO.
-    Возвращает True, если что-то выдали на этом вызове.
-    """
+    """Выдать временный PRO и/или стикер за достижение порога приглашённых друзей."""
+    if not REF_ENABLED or not _REF_TIERS:
+        return False
+
     try:
-        stats = storage.get_ref_stats(referrer_id)
+        stats = storage.get_ref_stats(referrer_id)  # {'total': ..., 'rewarded': ...}
         done = int(stats.get("rewarded", 0))
     except Exception:
         logger.exception("ref stats error")
         return False
 
-    if not _REF_TIERS:
-        return False
-
     awarded_any = False
 
-    for idx, (need, pro_days) in enumerate(_REF_TIERS):
+    for need, pro_days in _REF_TIERS:
         try:
-            # уже выдавали за этот порог?
-            if storage.is_tier_awarded(referrer_id, need):
-                continue
-            # достигнут порог?
-            if done < need:
+            if done < need or storage.is_tier_awarded(referrer_id, need):
                 continue
 
-            # 1) Выдать временный PRO
+            # выдаём временный PRO (наращиваем, если уже есть)
             try:
-                if pro_days > 0:
-                    if hasattr(storage, "award_temp_pro_days"):
-                        storage.award_temp_pro_days(referrer_id, pro_days)
-                    elif hasattr(storage, "add_pro_for_days"):
-                        # совместимость с твоим именем функции
-                        storage.add_pro_for_days(referrer_id, pro_days)  # type: ignore
+                if hasattr(storage, "add_pro_for_days"):
+                    storage.add_pro_for_days(referrer_id, int(pro_days))
+                elif hasattr(storage, "award_temp_pro_days"):
+                    storage.award_temp_pro_days(referrer_id, int(pro_days))  # fallback
             except Exception:
                 logger.exception("award temp PRO error")
 
-            # 2) Пометить порог как выданный
+            # помечаем порог выданным
             try:
                 storage.mark_tier_awarded(referrer_id, need)
             except Exception:
                 logger.exception("mark tier awarded error")
 
-            # 3) Попробовать отправить стикер
+            # стикер (если настроен именно для этого порога)
             try:
-                sticker_id = None
-                # Вариант 1: есть маппинг вида {need: file_id}
-                if "_STICKERS_BY_TIER" in globals() and isinstance(_STICKERS_BY_TIER, dict):
-                    sticker_id = _STICKERS_BY_TIER.get(need)
-                # Вариант 2: список в том же порядке, что _REF_TIERS
-                elif "REF_TIER_STICKERS" in globals() and isinstance(REF_TIER_STICKERS, (list, tuple)):
-                    if 0 <= idx < len(REF_TIER_STICKERS):
-                        sid = (REF_TIER_STICKERS[idx] or "").strip()
-                        if sid:
-                            sticker_id = sid
+                sticker_id = _ref_sticker_for_tier(need)
                 if sticker_id:
                     await ctx.bot.send_sticker(referrer_id, sticker=sticker_id)
             except Exception:
-                # стикер — не критично
                 pass
 
-            # 4) Уведомление с остатком PRO
+            # уведомление + остаток временного PRO
             try:
                 rem = 0
                 if hasattr(storage, "get_pro_remaining_days"):
                     rem = int(storage.get_pro_remaining_days(referrer_id))
-                msg = f"🏅 Достижение: {need} друзей!\n+PRO на {pro_days} дн."
+                msg = f"🏅 Достижение: {need} друзей!\n+PRO на {int(pro_days)} дн."
                 if rem > 0:
                     msg += f"\nТекущий временный PRO: ещё {rem} дн."
                 await ctx.bot.send_message(referrer_id, msg)
             except Exception:
-                # уведомление — не критично
                 pass
 
             awarded_any = True
