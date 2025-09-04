@@ -31,7 +31,15 @@ from app.config import (
     OVERAGE_PRICE_RUB,
     MAX_FILE_SIZE_MB,
     URL_MAX_FILE_SIZE_MB,
+    # ↓ Рефералки
+    REF_ENABLED,
+    REF_BONUS_MINUTES,
+    REF_MAX_REWARDS_PER_REFERRER_PER_DAY,
+    REF_TIERS,
+    REF_TIER_STICKERS,
 )
+
+from datetime import date
 from app import storage
 from app.utils import format_seconds
 from app.task_queue import task_queue
@@ -136,6 +144,46 @@ def _docx_spk_opts(context: ContextTypes.DEFAULT_TYPE) -> dict:
     d.setdefault("marker", "●")
     return d
 
+def _parse_ref_tiers(s: str) -> list[tuple[int, int]]:
+    out = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        a, b = part.split(":", 1)
+        try:
+            out.append((int(a), int(b)))
+        except Exception:
+            pass
+    out.sort(key=lambda x: x[0])
+    return out
+
+_REF_TIERS = _parse_ref_tiers(REF_TIERS)
+
+async def _maybe_award_ref_tier(referrer_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выдать временный PRO за достижение порога приглашенных друзей."""
+    try:
+        stats = storage.get_ref_stats(referrer_id)
+        done = int(stats.get("rewarded", 0))
+        if not _REF_TIERS:
+            return
+        for idx, (need, pro_days) in enumerate(_REF_TIERS):
+            if done >= need and not storage.is_tier_awarded(referrer_id, need):
+                storage.add_pro_for_days(referrer_id, pro_days)
+                storage.mark_tier_awarded(referrer_id, need)
+                # уведомление
+                try:
+                    if idx < len(REF_TIER_STICKERS) and REF_TIER_STICKERS[idx].strip():
+                        await ctx.bot.send_sticker(referrer_id, REF_TIER_STICKERS[idx].strip())
+                except Exception:
+                    pass
+                try:
+                    await ctx.bot.send_message(referrer_id, f"🏅 Достижение: {need} друзей!\n+PRO на {pro_days} дн.")
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("Tier award error")
+
 def _docx_spk_keyboard(opts: dict) -> InlineKeyboardMarkup:
     legend = "✅" if opts.get("legend") else "❌"
     ts = "✅" if opts.get("timestamps") else "❌"
@@ -194,6 +242,27 @@ async def _reject_if_too_big(update: Update, file_type: str) -> bool:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    # deep-link: /start ref_<code>
+    if REF_ENABLED and context.args:
+        arg = (context.args[0] or "").strip()
+        if arg.startswith("ref_"):
+            code = arg[4:]
+            try:
+                referrer_id = storage.resolve_ref_code(code)
+                if referrer_id and referrer_id != user.id:
+                    if storage.bind_referral(referrer_id, user.id):
+                        try:
+                            await context.bot.send_message(
+                                referrer_id,
+                                f"🙌 К вам присоединился новый друг: {user.full_name}!"
+                            )
+                        except Exception:
+                            pass
+                        await update.message.reply_text("Вы пришли по реферальной ссылке. Добро пожаловать! 🎉")
+            except Exception:
+                logger.exception("start/ref bind error")
+
     text = (
         f"Привет, {user.first_name}! 👋\n\n"
         "Я — AI-Vera. Быстро превращаю аудио и видео в текст.\n\n"
@@ -204,7 +273,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Полезное:\n"
         "• ⏱ /stats — лимиты и докупка минут\n"
         "• ℹ️ /help — подсказки и форматы\n"
-        "• 💎 /premium — перейти на PRO\n\n"
+        "• 💎 /premium — перейти на PRO\n"
+        "• 🎁 /ref — пригласить друзей и получать бонусы\n\n"
         "Готов? Выбери действие в меню ниже или просто пришли файл/ссылку."
     )
     await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
@@ -214,6 +284,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_pro = storage.is_pro(user_id)
 
     base_text = limit_manager.get_usage_info(user_id)
+    try:
+        rem = storage.get_pro_remaining_days(user_id)
+        if rem > 0 and not is_pro:
+            base_text += f"\nВременный PRO: ещё {rem} дн."
+    except Exception:
+        pass
 
     q = task_queue.get_queue_stats()
     queue_line = (
@@ -350,6 +426,53 @@ async def backend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Бэкенд: {WHISPER_BACKEND}\n"
         f"• Модель: {WHISPER_MODEL}"
     )
+
+async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not REF_ENABLED:
+        await update.message.reply_text("Реферальная программа временно недоступна.")
+        return
+    uid = update.effective_user.id
+    code = storage.get_or_create_ref_code(uid)
+    try:
+        bot_username = (await context.bot.get_me()).username
+    except Exception:
+        bot_username = "YourBot"
+    link = f"https://t.me/{bot_username}?start=ref_{code}"
+
+    st = storage.get_ref_stats(uid)
+    total = int(st.get("total", 0))
+    done = int(st.get("rewarded", 0))
+
+    lines = ["🎁 Реферальная программа", f"Ваша ссылка:\n{link}", ""]
+    if _REF_TIERS:
+        lines.append("Пороги и награды:")
+        for need, pro_days in _REF_TIERS:
+            cur = min(done, need)
+            bar_len = 10
+            fill = max(0, min(bar_len, round(bar_len * cur / need)))
+            bar = "■" * fill + "□" * (bar_len - fill)
+            status = "✅" if storage.is_tier_awarded(uid, need) else f"{cur}/{need}"
+            lines.append(f"• {need} друзей → PRO {pro_days} дн.  [{bar}]  {status}")
+        lines.append("")
+    lines.append(f"Статистика: приглашено — {total}, награждено — {done}, в ожидании — {total - done}.")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Открыть ссылку", url=link)],
+        [InlineKeyboardButton("📋 Скопировать ссылку", callback_data=f"copyref:{code}")]
+    ])
+    await update.message.reply_text("\n".join(lines), reply_markup=kb)
+
+async def copyref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    code = (q.data or "").split(":", 1)[-1]
+    try:
+        bot_username = (await context.bot.get_me()).username
+    except Exception:
+        bot_username = "YourBot"
+    link = f"https://t.me/{bot_username}?start=ref_{code}"
+    await q.message.reply_text(f"Ваша реферальная ссылка:\n{link}")
+
 
 # ---------- Вспомагательные для файлов/форматов ----------
 
@@ -531,6 +654,27 @@ async def process_via_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     )
                     await queue_msg.edit_text("✅ Готово!")
 
+                                   # --- Реферальный бонус за "первую удачную транскрибацию друга" ---
+                    if REF_ENABLED:
+                        try:
+                            referrer_id = storage.get_referrer(user_id)
+                            if referrer_id and not storage.has_first_reward(user_id):
+                                # лимит на выдачи в сутки конкретному рефереру
+                                if storage.get_today_rewarded_count(referrer_id) < int(REF_MAX_REWARDS_PER_REFERRER_PER_DAY):
+                                    storage.add_overage_seconds(referrer_id, int(REF_BONUS_MINUTES) * 60)
+                                    storage.mark_referral_rewarded(user_id)
+                                    try:
+                                        await context.bot.send_message(
+                                            referrer_id,
+                                            f"🎉 Ваш друг сделал первую расшифровку — +{int(REF_BONUS_MINUTES)} мин на сегодня!"
+                                        )
+                                    except Exception:
+                                        pass
+                                    # возможно, достигнут порог → выдать временный PRO / отправить медаль
+                                    await _maybe_award_ref_tier(referrer_id, context)
+                        except Exception:
+                            logger.exception("referral first-transcription reward error")
+                 
                 else:
                     err = result.get("error")
                     if err == "limit_exceeded":
@@ -1048,6 +1192,9 @@ def main():
     app.add_handler(CommandHandler("addpro", add_pro_command))
     app.add_handler(CommandHandler("removepro", remove_pro_command))
     app.add_handler(CommandHandler("backend", backend_command))
+    application.add_handler(CommandHandler("ref", ref_command))
+    application.add_handler(CallbackQueryHandler(copyref_callback, pattern=r"^copyref:"))
+
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
