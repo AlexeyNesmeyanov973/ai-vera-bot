@@ -159,7 +159,6 @@ def _parse_ref_tiers(s: str) -> list[tuple[int, int]]:
     out.sort(key=lambda x: x[0])
     return out
 
-# используем то, что импортировали: REF_TIERS as REF_TIERS_RAW
 _REF_TIERS: list[tuple[int, int]] = _parse_ref_tiers(REF_TIERS_RAW)
 
 def _parse_tier_stickers(raw) -> dict[int, str]:
@@ -198,6 +197,9 @@ def _parse_tier_stickers(raw) -> dict[int, str]:
     return mapping
 
 _REF_TIER_STICKERS_MAP: dict[int, str] = _parse_tier_stickers(REF_TIER_STICKERS)
+
+def _ref_sticker_for_tier(need: int) -> str | None:
+    return _REF_TIER_STICKERS_MAP.get(int(need))
 
 def _ref_sticker_for_tier(need: int) -> str | None:
     return _REF_TIER_STICKERS_MAP.get(int(need))
