@@ -35,8 +35,8 @@ from app.config import (
     REF_ENABLED,
     REF_BONUS_MINUTES,
     REF_MAX_REWARDS_PER_REFERRER_PER_DAY,
-    REF_TIERS,
-    REF_TIER_STICKERS,
+    REF_TIERS,            # строка с порогами из .env
+    REF_TIER_STICKERS,    # опционально
 )
 
 from datetime import date
@@ -474,7 +474,10 @@ async def copyref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = "YourBot"
     link = f"https://t.me/{bot_username}?start=ref_{code}"
     await q.message.reply_text(f"Ваша реферальная ссылка:\n{link}")
-
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 # ---------- Вспомагательные для файлов/форматов ----------
 
