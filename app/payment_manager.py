@@ -1,20 +1,22 @@
+# app/payment_manager.py
 import logging
 import hmac
 import hashlib
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 
 from app import storage
 
 logger = logging.getLogger(__name__)
 
+
 class PaymentManager:
     """
     Prodamus:
-    - verify_webhook_signature
-    - get_payment_url (PRO)
-    - get_topup_url (докупка минут)
-    - handle_webhook: применяет PRO или докупку, с идемпотентностью по payment_id
+      - verify_webhook_signature(raw_payload, headers) -> bool
+      - get_payment_url(user_id, amount?)
+      - get_topup_url(user_id, minutes, amount)
+      - handle_webhook(payload) -> Dict (idempotent)
     """
 
     SIGNATURE_HEADER_CANDIDATES = [
@@ -29,91 +31,69 @@ class PaymentManager:
         self.payment_link_base = payment_link_base
         self.default_amount = float(default_amount or 0.0)
 
-    # ----------------- Вспомогательные -----------------
+    # ----------------- helpers -----------------
 
     def _extract_signature(self, headers: Dict[str, str]) -> Optional[str]:
-        """Пытаемся достать подпись из разных заголовков, без учёта регистра."""
         if not headers:
             return None
-        # прямое совпадение
-        for key in self.SIGNATURE_HEADER_CANDIDATES:
-            if key in headers:
-                return headers.get(key)
+        # прямое имя
+        for k in self.SIGNATURE_HEADER_CANDIDATES:
+            if k in headers:
+                return headers.get(k)
         # без учёта регистра
-        lower_map = {k.lower(): v for k, v in headers.items()}
-        for key in self.SIGNATURE_HEADER_CANDIDATES:
-            v = lower_map.get(key.lower())
+        lower = {k.lower(): v for k, v in headers.items()}
+        for k in self.SIGNATURE_HEADER_CANDIDATES:
+            v = lower.get(k.lower())
             if v:
                 return v
         return None
 
     @staticmethod
     def _normalize_signature(sig: str) -> str:
-        """Удаляем возможный префикс 'sha256=' и приводим к нижнему регистру."""
         s = (sig or "").strip().strip('"').strip("'")
         if s.lower().startswith("sha256="):
             s = s[7:]
         return s.lower()
 
-    def verify_webhook_signature(self, raw_payload: bytes, headers: Dict[str, str]) -> bool:
-        """HMAC-SHA256 по всему «сыроому» телу запроса."""
+    @staticmethod
+    def _safe_int(v: Any) -> Optional[int]:
         try:
-            signature = self._extract_signature(headers)
-            if not signature:
-                logger.warning("Prodamus: подпись вебхука отсутствует")
-                return False
-            expected = hmac.new(self.webhook_secret, raw_payload, hashlib.sha256).hexdigest()
-            return hmac.compare_digest(expected, self._normalize_signature(signature))
-        except Exception as e:
-            logger.error(f"Prodamus: ошибка проверки подписи: {e}")
-            return False
+            return int(v)
+        except Exception:
+            return None
 
     def _extract_user_id(self, payload: Dict) -> Optional[int]:
-        """
-        Пытаемся достать user_id из разных мест.
-        """
-        candidates = [
+        """Пробуем вытащить user_id из разных мест (и вложенных структур)."""
+        cands = [
             payload.get("user_id"),
             (payload.get("order") or {}).get("user_id"),
             (payload.get("client") or {}).get("user_id"),
             (payload.get("customer") or {}).get("user_id"),
-            # часто user_id кладут в метаданные:
-            ((payload.get("custom_fields") or {}).get("user_id") if isinstance(payload.get("custom_fields"), dict) else None),
-            ((payload.get("params") or {}).get("user_id") if isinstance(payload.get("params"), dict) else None),
-            # запасные варианты
+            (payload.get("metadata") or {}).get("user_id"),
+            (payload.get("custom_fields") or {}).get("user_id") if isinstance(payload.get("custom_fields"), dict) else None,
+            (payload.get("params") or {}).get("user_id") if isinstance(payload.get("params"), dict) else None,
+            # запасные (часто кладут просто id внутрь вложений)
             (payload.get("user") or {}).get("id") if isinstance(payload.get("user"), dict) else None,
             (payload.get("customer") or {}).get("id") if isinstance(payload.get("customer"), dict) else None,
         ]
-        for v in candidates:
-            if v is None:
-                continue
-            try:
-                return int(v)
-            except Exception:
-                continue
+        for v in cands:
+            v_int = self._safe_int(v)
+            if v_int is not None:
+                return v_int
         return None
 
     def _extract_minutes(self, payload: Dict) -> int:
-        """Ищем minutes в разных местах."""
-        paths = [
-            ("params", "minutes"),
-            ("custom_fields", "minutes"),
-            ("order", "minutes"),
-            ("metadata", "minutes"),
-        ]
-        for p, k in paths:
-            d = payload.get(p) or {}
-            if isinstance(d, dict) and k in d:
-                try:
-                    return int(d[k])
-                except Exception:
-                    pass
+        """Ищем minutes в распространённых местах."""
+        for key in ("params", "custom_fields", "order", "metadata"):
+            d = payload.get(key) or {}
+            if isinstance(d, dict) and "minutes" in d:
+                v = self._safe_int(d.get("minutes"))
+                if v is not None and v > 0:
+                    return v
         return 0
 
     def _extract_payment_id(self, payload: Dict) -> Optional[str]:
-        """
-        Находим уникальный идентификатор платежа/счёта, чтобы обеспечить идемпотентность.
-        """
+        """ID платежа/счёта/транзакции (для идемпотентности)."""
         cands = [
             payload.get("id"),
             payload.get("payment_id"),
@@ -121,7 +101,6 @@ class PaymentManager:
             payload.get("transaction_id"),
             payload.get("uuid"),
             payload.get("hash"),
-            # вложенные
             (payload.get("order") or {}).get("id"),
             (payload.get("order") or {}).get("uid"),
             (payload.get("invoice") or {}).get("id"),
@@ -139,7 +118,20 @@ class PaymentManager:
         new_query = urlencode(q)
         return urlunparse((url.scheme, url.netloc, url.path, url.params, new_query, url.fragment))
 
-    # ----------------- Публичные методы -----------------
+    # ----------------- public API -----------------
+
+    def verify_webhook_signature(self, raw_payload: bytes, headers: Dict[str, str]) -> bool:
+        """HMAC-SHA256 по «сырым» байтам тела запроса. Возвращает True/False."""
+        try:
+            sig = self._extract_signature(headers)
+            if not sig:
+                logger.warning("Prodamus: подпись отсутствует")
+                return False
+            expected = hmac.new(self.webhook_secret, raw_payload, hashlib.sha256).hexdigest()
+            return hmac.compare_digest(expected, self._normalize_signature(sig))
+        except Exception as e:
+            logger.error("Prodamus: ошибка проверки подписи: %s", e)
+            return False
 
     # === PRO ===
     def get_payment_url(self, user_id: int, amount: Optional[float] = None) -> str:
@@ -148,7 +140,7 @@ class PaymentManager:
             return self._append_query(self.payment_link_base, {
                 "user_id": user_id,
                 "amount": f"{amt:.2f}",
-                "type": "pro"
+                "type": "pro",
             })
         return f"https://payform.prodamus.ru/?user_id={user_id}&amount={amt:.2f}&type=pro"
 
@@ -167,10 +159,10 @@ class PaymentManager:
 
     async def handle_webhook(self, payload: Dict) -> Dict:
         """
-        Основная логика применения платежа:
-        - проверяем идемпотентность по payment_id
-        - читаем тип 'pro'/'topup' и минуты
-        - выдаём PRO или начисляем минуты
+        Применяет оплату:
+          • Идемпотентность по payment_id
+          • type: pro/topup
+          • minutes (для topup)
         """
         try:
             user_id = self._extract_user_id(payload)
@@ -180,51 +172,49 @@ class PaymentManager:
             event = (payload.get("event") or "").lower()
             status = (payload.get("status") or "").lower()
 
-            # тип операции (где чаще всего лежит)
+            # тип операции (в metadata/params/custom_fields/order)
             pay_type = ""
-            for path in ("params", "custom_fields", "order", "metadata"):
-                d = payload.get(path) or {}
+            for key in ("params", "custom_fields", "order", "metadata"):
+                d = payload.get(key) or {}
                 if isinstance(d, dict) and d.get("type"):
-                    pay_type = d.get("type")
+                    pay_type = str(d.get("type"))
             pay_type = (pay_type or "").lower()
 
             minutes = self._extract_minutes(payload)
 
-            # идемпотентность
             payment_id = self._extract_payment_id(payload) or ""
             if payment_id and storage.is_payment_processed("prodamus", payment_id):
                 logger.info("Prodamus: duplicate webhook ignored (%s)", payment_id)
                 return {"success": True, "message": "already processed"}
 
-            # некоторые инсталляции присылают разные статусы
+            # Расширенная эвристика «оплачен»
             paid = (
-                status in ("success", "paid", "succeeded", "completed", "done", "ok")
+                status in {"success", "paid", "succeeded", "completed", "done", "ok"}
                 or ("paid" in event or "succeed" in event or "complete" in event)
+                or bool(payload.get("paid") or payload.get("is_paid"))
             )
 
             if paid:
-                # помечаем до побочных действий (защита от дублей)
                 if payment_id:
                     storage.mark_payment_processed("prodamus", payment_id)
 
                 if pay_type == "topup" and minutes > 0:
                     storage.add_overage_seconds(user_id, minutes * 60)
-                    logger.info(f"Prodamus: user {user_id} TOPUP +{minutes}m (payment_id={payment_id})")
-                    return {"success": True, "message": f"User {user_id} topped up {minutes}m"}
+                    logger.info("Prodamus: user %s TOPUP +%sm (payment_id=%s)", user_id, minutes, payment_id)
+                    return {"success": True, "message": f"user {user_id} topped up {minutes}m"}
 
-                # по умолчанию — апгрейд до PRO
+                # по умолчанию — PRO
                 storage.add_pro(user_id)
-                logger.info(f"Prodamus: user {user_id} upgraded to PRO (payment_id={payment_id})")
-                return {"success": True, "message": f"User {user_id} upgraded to PRO"}
+                logger.info("Prodamus: user %s upgraded to PRO (payment_id=%s)", user_id, payment_id)
+                return {"success": True, "message": f"user {user_id} upgraded to PRO"}
 
-            refunded = (status in ("refund", "refunded")) or ("refund" in event)
+            refunded = (status in {"refund", "refunded"}) or ("refund" in event)
             if refunded:
-                # докупку мин обычно не откатываем
-                logger.info(f"Prodamus: refund event for user {user_id} (payment_id={payment_id})")
+                logger.info("Prodamus: refund for user %s (payment_id=%s)", user_id, payment_id)
                 return {"success": True, "message": "refund processed (no change)"}
 
-            logger.info(f"Prodamus: webhook received (no change): event={event}, status={status}, payment_id={payment_id}")
+            logger.info("Prodamus: webhook received (no change) event=%s status=%s payment_id=%s", event, status, payment_id)
             return {"success": True, "message": "Webhook received"}
         except Exception as e:
-            logger.error(f"Prodamus webhook error: {e}")
+            logger.exception("Prodamus webhook error")
             return {"success": False, "error": str(e)}
