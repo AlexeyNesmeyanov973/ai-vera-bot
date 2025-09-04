@@ -1292,9 +1292,8 @@ def main():
     app.add_handler(CommandHandler("addpro", add_pro_command))
     app.add_handler(CommandHandler("removepro", remove_pro_command))
     app.add_handler(CommandHandler("backend", backend_command))
-    application.add_handler(CommandHandler("ref", ref_command))
-    application.add_handler(CallbackQueryHandler(copyref_callback, pattern=r"^copyref:"))
-
+    app.add_handler(CommandHandler("ref", ref_command))
+    app.add_handler(CallbackQueryHandler(copyref_callback, pattern=r"^copyref:"))
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
