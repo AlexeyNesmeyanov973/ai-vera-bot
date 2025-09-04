@@ -26,12 +26,12 @@ except Exception:
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; AI-Vera/1.0; +https://t.me/)",
+    "Accept": "*/*",
 }
 
 DIRECT_FILE_EXT = (
     ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac",
     ".mp4", ".avi", ".mov", ".wmv", ".flv", ".mkv", ".webm",
-    "Accept": "*/*",
 )
 
 YTDLP_DOMAINS = (
@@ -50,9 +50,11 @@ _CONTENT_TYPE_TO_EXT = {
     "audio/webm": ".webm",
     "video/mp4": ".mp4",
     "video/webm": ".webm",
-    # Максимум редиректов для HTTP-запросов
-    _MAX_REDIRECTS = 5
 }
+
+# Максимум редиректов и ретраев резюма для HTTP-запросов
+_MAX_REDIRECTS = 5
+_RESUME_RETRIES = 3
 
 
 def _safe_name(prefix: str = "media") -> str:
@@ -77,68 +79,154 @@ async def _download_direct_stream(
     headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Потоковая докачка напрямую по URL (HTTP GET) с ограничением на общий размер.
+    Потоковая загрузка напрямую по URL (HTTP GET) с ограничением на общий размер.
+    Поддерживает докачку по Range при обрывах, если сервер разрешает.
     """
     os.makedirs(dest_dir, exist_ok=True)
     fname = _safe_name("download")
     out_path = os.path.join(dest_dir, fname + ".bin")
 
-    chunk_size = max(1, int(STREAM_CHUNK_MB * 1024 * 1024))
+    chunk_size = max(1, int(float(STREAM_CHUNK_MB) * 1024 * 1024))
     # общий «стоп-кран» = ~4× таймаут чтения сокета
-    timeout = aiohttp.ClientTimeout(total=max(5, int(STREAM_TIMEOUT_S) * 4),
-                                    sock_read=int(STREAM_TIMEOUT_S))
+    timeout = aiohttp.ClientTimeout(
+        total=max(5, int(STREAM_TIMEOUT_S) * 4),
+        sock_read=int(STREAM_TIMEOUT_S),
+    )
     total = 0
+    allow_resume = bool(int(RESUME_DOWNLOADS))
+    expected_size: Optional[int] = None
+    accept_ranges = False
 
-    # Пул коннектов ограничим немного, чтобы не «забить» контейнер
     connector = aiohttp.TCPConnector(limit=8)
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers or DEFAULT_HEADERS, connector=connector) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers or DEFAULT_HEADERS,
+        connector=connector
+    ) as session:
         # HEAD — попробуем заранее понять размер (не все сервера поддерживают)
         try:
             async with session.head(url, allow_redirects=True, max_redirects=_MAX_REDIRECTS) as hresp:
-                 if hresp.status // 100 == 2:
                 if hresp.status // 100 == 2:
                     cl = hresp.headers.get("Content-Length")
                     if cl and cl.isdigit():
-                        size_mb = int(cl) / (1024 * 1024)
+                        expected_size = int(cl)
+                        size_mb = expected_size / (1024 * 1024)
                         if size_mb > max_size_mb:
                             return {"success": False, "error": f"Файл больше {max_size_mb} МБ"}
+                    ar = (hresp.headers.get("Accept-Ranges", "") or "").lower()
+                    accept_ranges = ("bytes" in ar) or (ar == "bytes")
         except Exception:
+            # игнорируем — просто не знаем размер/диапазоны
             pass
 
-        try:
-            resp_ctx = session.get(url, allow_redirects=True, max_redirects=_MAX_REDIRECTS)
-        except Exception as e:
-            return {"success": False, "error": f"HTTP init error: {e}"}
-
-        async with resp_ctx as resp:
-            if resp.status != 200:
-                return {"success": False, "error": f"HTTP {resp.status}"}
-
-            # Имя файла
-            cd = resp.headers.get("Content-Disposition", "")
-            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
-            if m:
-                out_name = _sanitize_filename(m.group(1))
-                out_path = os.path.join(dest_dir, out_name)
-
-            # Расширение по content-type, если не смогли угадать
-            ctype = resp.headers.get("Content-Type", "").split(";")[0].lower()
-            if out_path.endswith(".bin") and ctype in _CONTENT_TYPE_TO_EXT:
-                out_path = out_path[:-4] + _CONTENT_TYPE_TO_EXT[ctype]
-
-            with open(out_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(chunk_size):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    total += len(chunk)
-                    if total > max_size_mb * 1024 * 1024:
+        def _maybe_adjust_name(resp_headers: Dict[str, str]) -> None:
+            """Переименовываем файл исходя из заголовков ответа (CD/CT)."""
+            nonlocal out_path
+            try:
+                cd = resp_headers.get("Content-Disposition", "") or ""
+                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
+                if m:
+                    out_name = _sanitize_filename(m.group(1))
+                    new_path = os.path.join(dest_dir, out_name)
+                    if new_path != out_path and os.path.exists(out_path):
                         try:
-                            f.close()
-                            os.remove(out_path)
+                            os.replace(out_path, new_path)
                         except Exception:
                             pass
-                        return {"success": False, "error": f"Файл больше {max_size_mb} МБ"}
+                        out_path = new_path
+
+                ctype = (resp_headers.get("Content-Type", "") or "").split(";")[0].lower()
+                if out_path.endswith(".bin") and ctype in _CONTENT_TYPE_TO_EXT:
+                    new_path = out_path[:-4] + _CONTENT_TYPE_TO_EXT[ctype]
+                    if new_path != out_path and os.path.exists(out_path):
+                        try:
+                            os.replace(out_path, new_path)
+                        except Exception:
+                            pass
+                        out_path = new_path
+            except Exception:
+                pass
+
+        # Основной цикл с поддержкой докачки
+        attempts = 0
+        downloaded = 0
+        mode = "wb"  # при первом заходе перезаписываем
+
+        while True:
+            headers_req: Dict[str, str] = {}
+            if allow_resume and (accept_ranges or expected_size) and downloaded > 0:
+                headers_req["Range"] = f"bytes={downloaded}-"
+                mode = "ab"
+
+            try:
+                resp_ctx = session.get(
+                    url,
+                    allow_redirects=True,
+                    max_redirects=_MAX_REDIRECTS,
+                    headers=headers_req or None,
+                )
+            except Exception as e:
+                return {"success": False, "error": f"HTTP init error: {e}"}
+
+            try:
+                async with resp_ctx as resp:
+                    # 200 — полное тело, 206 — частичный ответ по Range
+                    if resp.status not in (200, 206):
+                        return {"success": False, "error": f"HTTP {resp.status}"}
+
+                    _maybe_adjust_name(resp.headers)
+
+                    # Если запросили Range, а отдали 200 — начнём заново
+                    if "Range" in headers_req and resp.status == 200:
+                        downloaded = 0
+                        mode = "wb"
+
+                    # Обновим ожидаемый размер по Content-Range
+                    cr = resp.headers.get("Content-Range")
+                    if cr:
+                        m = re.search(r"/(\d+)$", cr)
+                        if m:
+                            try:
+                                expected_size = int(m.group(1))
+                            except Exception:
+                                pass
+
+                    with open(out_path, mode) as f:
+                        async for chunk in resp.content.iter_chunked(chunk_size):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            total += len(chunk)
+                            downloaded += len(chunk)
+
+                            if total > max_size_mb * 1024 * 1024:
+                                try:
+                                    f.close()
+                                    os.remove(out_path)
+                                except Exception:
+                                    pass
+                                return {"success": False, "error": f"Файл больше {max_size_mb} МБ"}
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                attempts += 1
+                if not allow_resume or attempts > _RESUME_RETRIES:
+                    return {"success": False, "error": f"Сетевая ошибка: {e}"}
+                # попробуем докачать
+                continue
+
+            # Стрим завершился без исключений — проверим, всё ли скачали
+            if expected_size is None:
+                break  # размер неизвестен — считаем, что скачивание закончено
+            if downloaded >= expected_size:
+                break
+
+            # Если не добрали — ещё одна попытка докачки
+            if not allow_resume:
+                break
+            attempts += 1
+            if attempts > _RESUME_RETRIES:
+                return {"success": False, "error": "Не удалось докачать файл: исчерпаны попытки"}
+            continue
 
     size_mb = total / (1024 * 1024)
     return {
@@ -163,7 +251,7 @@ async def _download_with_ytdlp(
 
     os.makedirs(dest_dir, exist_ok=True)
     base = os.path.join(dest_dir, _safe_name("ytdlp"))
-    ytfmt = "bestaudio/best" if str(YTDLP_AUDIO_ONLY) in ("1", "true", "yes") else "best"
+    ytfmt = "bestaudio/best" if str(YTDLP_AUDIO_ONLY).lower() in ("1", "true", "yes", "y", "on") else "best"
 
     ydl_opts = {
         "outtmpl": base + ".%(ext)s",
@@ -173,23 +261,24 @@ async def _download_with_ytdlp(
         "no_warnings": True,
         "retries": 3,
         "http_headers": DEFAULT_HEADERS,
-         жёсткий таймаут сокета для нестабильных источников
+        # жёсткий таймаут сокета для нестабильных источников
         "socket_timeout": int(STREAM_TIMEOUT_S) or 30,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
             info = ydl.extract_info(url, download=True)
+            out_path = ydl.prepare_filename(info)
     except Exception as e:
         return {"success": False, "error": f"yt-dlp error: {e}"}
-        out_path = ydl.prepare_filename(info)
-        if not os.path.exists(out_path):
-            # Попробуем подобрать итоговый файл, если расширение изменилось
-            stem = os.path.basename(out_path).rsplit(".", 1)[0]
-            for f in os.listdir(dest_dir):
-                if f.startswith(stem + "."):
-                    out_path = os.path.join(dest_dir, f)
-                    break
+
+    if not os.path.exists(out_path):
+        # Попробуем подобрать итоговый файл, если расширение изменилось
+        stem = os.path.basename(out_path).rsplit(".", 1)[0]
+        for f in os.listdir(dest_dir):
+            if f.startswith(stem + "."):
+                out_path = os.path.join(dest_dir, f)
+                break
 
     if not os.path.exists(out_path):
         return {"success": False, "error": "Не удалось сохранить файл yt-dlp"}
@@ -231,12 +320,13 @@ async def download_from_url(url: str, dest_dir: str, max_size_mb: float) -> Dict
         if any(d in url for d in YTDLP_DOMAINS):
             return await _download_with_ytdlp(url, dest_dir, max_size_mb)
 
-        # 1) пробуем как прямой файл
+        # 1) Пробуем как прямой файл
         res = await _download_direct_stream(url, dest_dir, max_size_mb)
         if res.get("success"):
             return res
-        # 2) фолбэк в yt-dlp
+        # 2) Фолбэк в yt-dlp
         return await _download_with_ytdlp(url, dest_dir, max_size_mb)
+
     except aiohttp.TooManyRedirects:
         return {"success": False, "error": f"Слишком много редиректов (>{_MAX_REDIRECTS})"}
     except asyncio.TimeoutError:
