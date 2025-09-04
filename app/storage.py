@@ -2,9 +2,9 @@
 import os
 import logging
 from typing import Optional, Tuple, Dict, Set
-import secrets
-import string
 from datetime import date, datetime, timedelta
+import random
+import string
 
 from app.config import REDIS_URL, DATABASE_URL
 
@@ -61,9 +61,7 @@ if DATABASE_URL:
               PRIMARY KEY (provider, payment_id)
             );
             """)
-
-            # === РЕФЕРАЛКИ ===
-            # реф.код пользователя
+            # Реферальные коды
             cur.execute("""
             CREATE TABLE IF NOT EXISTS referral_codes (
               user_id BIGINT PRIMARY KEY,
@@ -71,7 +69,7 @@ if DATABASE_URL:
               created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """)
-            # привязка "referred -> referrer"
+            # Привязка "referred -> referrer"
             cur.execute("""
             CREATE TABLE IF NOT EXISTS referrals (
               referred_id BIGINT PRIMARY KEY,
@@ -81,16 +79,14 @@ if DATABASE_URL:
               first_rewarded_at DATE
             );
             """)
-
-            # временный PRO до даты (включительно)
+            # Временный PRO до даты (включительно)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS pro_until (
               user_id BIGINT PRIMARY KEY,
               until_date DATE NOT NULL
             );
             """)
-
-            # выданные «пороги» (чтобы не выдавать повторно)
+            # Выданные «пороги» (чтобы не выдавать повторно)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS referral_tier_rewards (
               user_id BIGINT NOT NULL,
@@ -106,30 +102,31 @@ if DATABASE_URL:
 
 # ---- Memory fallback ----
 # user_usage: сколько базовых секунд из дневного лимита уже израсходовано сегодня
-_mem_usage: dict[int, Tuple[int, date]] = {}  # user_id -> (used_seconds:int, last_reset_date:date)
+_mem_usage: Dict[int, Tuple[int, date]] = {}
 # pro_users: множество PRO пользователей (постоянный)
-_mem_pro: set[int] = set()
+_mem_pro: Set[int] = set()
 # user_overage: докупленные секунды на сегодня
-_mem_overage: dict[int, Tuple[int, date]] = {}  # user_id -> (extra_seconds:int, last_reset_date:date)
+_mem_overage: Dict[int, Tuple[int, date]] = {}
 # processed_payments: идемпотентность платежей
-_mem_processed: set[tuple[str, str]] = set()
+_mem_processed: Set[Tuple[str, str]] = set()
 
-# временный PRO
-_mem_pro_until: dict[int, date] = {}  # user_id -> until_date
+# Временный PRO (pro_until)
+_mem_pro_until: Dict[int, date] = {}
 
-# рефералки: коды и привязки
-_mem_ref_code_by_user: dict[int, str] = {}
-_mem_user_by_ref_code: dict[str, int] = {}
+# Рефералки: коды и привязки
+_mem_ref_code_by_user: Dict[int, str] = {}
+_mem_user_by_ref_code: Dict[str, int] = {}
 # referred_id -> (referrer_id, first_rewarded: bool, first_rewarded_at: Optional[date])
-_mem_referrals: dict[int, Tuple[int, bool, Optional[date]]] = {}
-# выданные пороги
-_mem_ref_tier_awarded: dict[int, Set[int]] = {}
+_mem_referrals: Dict[int, Tuple[int, bool, Optional[date]]] = {}
+# Выданные пороги (need)
+_mem_ref_tier_awarded: Dict[int, Set[int]] = {}
 
 # ============================================================
 #                 БАЗОВЫЙ ЛИМИТ (user_usage)
 # ============================================================
 
 def get_usage(user_id: int) -> Tuple[int, date]:
+    # Redis
     if _redis:
         key = f"usage:{user_id}"
         try:
@@ -145,6 +142,7 @@ def get_usage(user_id: int) -> Tuple[int, date]:
         except Exception:
             pass
 
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -158,14 +156,17 @@ def get_usage(user_id: int) -> Tuple[int, date]:
         except Exception as e:
             logger.debug(f"Postgres get_usage error: {e}")
 
+    # Memory
     if user_id in _mem_usage:
         return _mem_usage[user_id]
 
+    # default
     today = date.today()
     return 0, today
 
 
 def set_usage(user_id: int, used_seconds: int, last_reset_date: date):
+    # Redis
     if _redis:
         try:
             key = f"usage:{user_id}"
@@ -180,6 +181,7 @@ def set_usage(user_id: int, used_seconds: int, last_reset_date: date):
         except Exception:
             pass
 
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -196,6 +198,7 @@ def set_usage(user_id: int, used_seconds: int, last_reset_date: date):
         except Exception as e:
             logger.debug(f"Postgres set_usage error: {e}")
 
+    # Memory
     _mem_usage[user_id] = (int(used_seconds), last_reset_date)
 
 # ============================================================
@@ -203,6 +206,7 @@ def set_usage(user_id: int, used_seconds: int, last_reset_date: date):
 # ============================================================
 
 def get_pro_until(user_id: int) -> Optional[date]:
+    # Redis
     if _redis:
         try:
             v = _redis.get(f"pro:until:{user_id}")
@@ -210,6 +214,7 @@ def get_pro_until(user_id: int) -> Optional[date]:
                 return date.fromisoformat(v)
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -219,6 +224,7 @@ def get_pro_until(user_id: int) -> Optional[date]:
                     return row[0]
         except Exception as e:
             logger.debug(f"Postgres get_pro_until error: {e}")
+    # Memory
     return _mem_pro_until.get(user_id)
 
 def add_pro_for_days(user_id: int, days: int) -> None:
@@ -227,25 +233,35 @@ def add_pro_for_days(user_id: int, days: int) -> None:
         return
     today = date.today()
     cur_until = get_pro_until(user_id) or today
-    start = max(today, cur_until)
+    start = max(today, cur_until)  # не укорачиваем, если уже есть срок
     new_until = start + timedelta(days=days)
 
+    # Redis
     if _redis:
         try:
             _redis.set(f"pro:until:{user_id}", new_until.isoformat(), ex=60*60*24*120)
         except Exception:
             pass
+
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO pro_until (user_id, until_date)
                     VALUES (%s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET until_date = GREATEST(pro_until.until_date, EXCLUDED.until_date)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                      until_date = GREATEST(pro_until.until_date, EXCLUDED.until_date)
                 """, (user_id, new_until))
         except Exception as e:
             logger.debug(f"Postgres add_pro_for_days error: {e}")
+
+    # Memory
     _mem_pro_until[user_id] = new_until
+
+def award_temp_pro_days(user_id: int, days: int) -> None:
+    """Алиас — оставлен для совместимости."""
+    add_pro_for_days(user_id, days)
 
 def get_pro_remaining_days(user_id: int) -> int:
     u = get_pro_until(user_id)
@@ -254,7 +270,7 @@ def get_pro_remaining_days(user_id: int) -> int:
     return max(0, (u - date.today()).days + 1)
 
 def is_pro(user_id: int) -> bool:
-    # постоянный PRO
+    # Постоянный PRO
     perm = False
     if _redis:
         try:
@@ -273,17 +289,18 @@ def is_pro(user_id: int) -> bool:
     if perm:
         return True
 
-    # временный PRO
+    # Временный PRO
     u = get_pro_until(user_id)
     return bool(u and u >= date.today())
 
-
 def add_pro(user_id: int):
+    # Redis
     if _redis:
         try:
             _redis.sadd("pro_users", user_id)
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -293,8 +310,8 @@ def add_pro(user_id: int):
                 )
         except Exception as e:
             logger.debug(f"Postgres add_pro error: {e}")
+    # Memory
     _mem_pro.add(user_id)
-
 
 def remove_pro(user_id: int):
     if _redis:
@@ -309,7 +326,6 @@ def remove_pro(user_id: int):
         except Exception as e:
             logger.debug(f"Postgres remove_pro error: {e}")
     _mem_pro.discard(user_id)
-
 
 def count_pro() -> int:
     if _redis:
@@ -332,6 +348,7 @@ def count_pro() -> int:
 # ============================================================
 
 def get_overage(user_id: int) -> Tuple[int, date]:
+    # Redis
     if _redis:
         key = f"overage:{user_id}"
         try:
@@ -345,6 +362,7 @@ def get_overage(user_id: int) -> Tuple[int, date]:
         except Exception:
             pass
 
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -358,14 +376,16 @@ def get_overage(user_id: int) -> Tuple[int, date]:
         except Exception as e:
             logger.debug(f"Postgres get_overage error: {e}")
 
+    # Memory
     if user_id in _mem_overage:
         return _mem_overage[user_id]
 
+    # default
     today = date.today()
     return 0, today
 
-
 def set_overage(user_id: int, extra_seconds: int, last_reset_date: date):
+    # Redis
     if _redis:
         try:
             key = f"overage:{user_id}"
@@ -380,6 +400,7 @@ def set_overage(user_id: int, extra_seconds: int, last_reset_date: date):
         except Exception:
             pass
 
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -396,8 +417,8 @@ def set_overage(user_id: int, extra_seconds: int, last_reset_date: date):
         except Exception as e:
             logger.debug(f"Postgres set_overage error: {e}")
 
+    # Memory
     _mem_overage[user_id] = (int(extra_seconds), last_reset_date)
-
 
 def add_overage_seconds(user_id: int, add_seconds: int):
     cur_extra, last = get_overage(user_id)
@@ -406,7 +427,6 @@ def add_overage_seconds(user_id: int, add_seconds: int):
         cur_extra = 0
         last = today
     set_overage(user_id, cur_extra + max(0, int(add_seconds)), last)
-
 
 def consume_overage_seconds(user_id: int, consume_seconds: int):
     cur_extra, last = get_overage(user_id)
@@ -424,12 +444,14 @@ def is_payment_processed(provider: str, payment_id: str) -> bool:
     if not provider or not payment_id:
         return False
 
+    # Redis
     if _redis:
         try:
             return bool(_redis.sismember(f"pp:{provider}", payment_id))
         except Exception:
             pass
 
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -441,21 +463,23 @@ def is_payment_processed(provider: str, payment_id: str) -> bool:
         except Exception as e:
             logger.debug(f"Postgres is_payment_processed error: {e}")
 
+    # Memory
     return (provider, payment_id) in _mem_processed
-
 
 def mark_payment_processed(provider: str, payment_id: str):
     if not provider or not payment_id:
         return
 
+    # Redis
     if _redis:
         try:
             key = f"pp:{provider}"
             _redis.sadd(key, payment_id)
-            _redis.expire(key, 60 * 60 * 24 * 90)
+            _redis.expire(key, 60 * 60 * 24 * 90)  # 90 дней
         except Exception:
             pass
 
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -470,22 +494,23 @@ def mark_payment_processed(provider: str, payment_id: str):
         except Exception as e:
             logger.debug(f"Postgres mark_payment_processed error: {e}")
 
+    # Memory
     _mem_processed.add((provider, payment_id))
 
 # ============================================================
 #                      РЕФЕРАЛЬНАЯ ПРОГРАММА
 # ============================================================
 
-# --- коды ---
-
+# --- генерация реф.кода (fallback) ---
 def _mem_make_ref_code(uid: int) -> str:
-    # простая, но стабильная генерация: uid в base36 + "r"
-    import random, string
+    # простая стабильная генерация: uid в hex + 3 случайных символа
     if uid <= 0:
         uid = random.randint(1000, 10_000_000)
     base = format(uid, "x")
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=3))
     return f"{base}{suffix}"
+
+# ---------- Реф-коды ----------
 
 def get_or_create_ref_code(user_id: int) -> str:
     # Redis
@@ -511,7 +536,7 @@ def get_or_create_ref_code(user_id: int) -> str:
                         "INSERT INTO referral_codes (user_id, code) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (user_id, code),
                     )
-                # обновим Redis
+                # обновим Redis и память
                 if _redis:
                     try:
                         _redis.set(f"refcode:{user_id}", code, ex=60*60*24*365)
@@ -536,6 +561,7 @@ def resolve_ref_code(code: str) -> Optional[int]:
     code = (code or "").strip()
     if not code:
         return None
+    # Redis
     if _redis:
         try:
             v = _redis.get(f"refcode:rev:{code}")
@@ -546,6 +572,7 @@ def resolve_ref_code(code: str) -> Optional[int]:
                     return None
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -555,9 +582,10 @@ def resolve_ref_code(code: str) -> Optional[int]:
                     return int(row[0])
         except Exception as e:
             logger.debug(f"Postgres resolve_ref_code error: {e}")
+    # Memory
     return _mem_user_by_ref_code.get(code)
 
-# --- привязки ---
+# ---------- Привязка друга к рефереру ----------
 
 def bind_referral(referrer_id: int, referred_id: int) -> bool:
     """Возвращает True, если привязка создана (первая)."""
@@ -568,6 +596,8 @@ def bind_referral(referrer_id: int, referred_id: int) -> bool:
     if get_referrer(referred_id):
         return False
 
+    inserted = False
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -578,13 +608,16 @@ def bind_referral(referrer_id: int, referred_id: int) -> bool:
                 inserted = cur.rowcount > 0
         except Exception as e:
             logger.debug(f"Postgres bind_referral error: {e}")
-            inserted = False
-    else:
-        inserted = referred_id not in _mem_referrals
-        if inserted:
-            _mem_referrals[referred_id] = (referrer_id, False, None)
 
-    # кэш
+    # Memory (если не вставилось в БД)
+    if not inserted:
+        if referred_id in _mem_referrals:
+            inserted = False
+        else:
+            _mem_referrals[referred_id] = (referrer_id, False, None)
+            inserted = True
+
+    # Кэш Redis
     if inserted and _redis:
         try:
             _redis.hset(f"ref:{referred_id}", mapping={"referrer_id": referrer_id, "first_rewarded": 0})
@@ -593,6 +626,7 @@ def bind_referral(referrer_id: int, referred_id: int) -> bool:
     return inserted
 
 def get_referrer(referred_id: int) -> Optional[int]:
+    # Redis
     if _redis:
         try:
             v = _redis.hget(f"ref:{referred_id}", "referrer_id")
@@ -600,6 +634,7 @@ def get_referrer(referred_id: int) -> Optional[int]:
                 return int(v)
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -609,11 +644,13 @@ def get_referrer(referred_id: int) -> Optional[int]:
                     return int(row[0])
         except Exception as e:
             logger.debug(f"Postgres get_referrer error: {e}")
+    # Memory
     if referred_id in _mem_referrals:
         return _mem_referrals[referred_id][0]
     return None
 
 def has_first_reward(referred_id: int) -> bool:
+    # Redis
     if _redis:
         try:
             v = _redis.hget(f"ref:{referred_id}", "first_rewarded")
@@ -621,6 +658,7 @@ def has_first_reward(referred_id: int) -> bool:
                 return str(v) == "1"
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -630,17 +668,20 @@ def has_first_reward(referred_id: int) -> bool:
                     return bool(row[0])
         except Exception as e:
             logger.debug(f"Postgres has_first_reward error: {e}")
+    # Memory
     if referred_id in _mem_referrals:
         return bool(_mem_referrals[referred_id][1])
     return False
 
 def mark_referral_rewarded(referred_id: int) -> None:
     today = date.today()
+    # Redis
     if _redis:
         try:
             _redis.hset(f"ref:{referred_id}", mapping={"first_rewarded": 1})
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -650,12 +691,14 @@ def mark_referral_rewarded(referred_id: int) -> None:
                 )
         except Exception as e:
             logger.debug(f"Postgres mark_referral_rewarded error: {e}")
+    # Memory
     if referred_id in _mem_referrals:
         ref_id, _, _ = _mem_referrals[referred_id]
         _mem_referrals[referred_id] = (ref_id, True, today)
 
 def get_today_rewarded_count(referrer_id: int) -> int:
     today = date.today()
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -667,7 +710,7 @@ def get_today_rewarded_count(referrer_id: int) -> int:
                 return int(cnt)
         except Exception as e:
             logger.debug(f"Postgres get_today_rewarded_count error: {e}")
-    # Memory/Redis best-effort
+    # Memory/Redis (best-effort)
     cnt = 0
     for _, (ref_id, rewarded, dt) in _mem_referrals.items():
         if ref_id == referrer_id and rewarded and dt == today:
@@ -678,6 +721,7 @@ def get_ref_stats(user_id: int) -> Dict[str, int]:
     """total — сколько привязано к этому рефереру; rewarded — сколько уже получили «первую награду»."""
     total = 0
     rewarded = 0
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -688,7 +732,7 @@ def get_ref_stats(user_id: int) -> Dict[str, int]:
                 return {"total": int(total), "rewarded": int(rewarded)}
         except Exception as e:
             logger.debug(f"Postgres get_ref_stats error: {e}")
-
+    # Memory
     for _, (ref_id, rew, _) in _mem_referrals.items():
         if ref_id == user_id:
             total += 1
@@ -699,27 +743,35 @@ def get_ref_stats(user_id: int) -> Dict[str, int]:
 # --- «Пороги» (трофеи) ---
 
 def is_tier_awarded(user_id: int, tier: int) -> bool:
+    # Redis
     if _redis:
         try:
             return bool(_redis.sismember(f"ref:tier:{user_id}", int(tier)))
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM referral_tier_rewards WHERE user_id=%s AND tier=%s", (user_id, int(tier)))
+                cur.execute(
+                    "SELECT 1 FROM referral_tier_rewards WHERE user_id=%s AND tier=%s",
+                    (user_id, int(tier)),
+                )
                 return cur.fetchone() is not None
         except Exception as e:
             logger.debug(f"Postgres is_tier_awarded error: {e}")
+    # Memory
     return int(tier) in _mem_ref_tier_awarded.get(user_id, set())
 
 def mark_tier_awarded(user_id: int, tier: int) -> None:
+    # Redis
     if _redis:
         try:
             _redis.sadd(f"ref:tier:{user_id}", int(tier))
             _redis.expire(f"ref:tier:{user_id}", 60*60*24*365)
         except Exception:
             pass
+    # Postgres
     if _pg_conn:
         try:
             with _pg_conn.cursor() as cur:
@@ -729,252 +781,6 @@ def mark_tier_awarded(user_id: int, tier: int) -> None:
                 )
         except Exception as e:
             logger.debug(f"Postgres mark_tier_awarded error: {e}")
+    # Memory
     s = _mem_ref_tier_awarded.setdefault(user_id, set())
     s.add(int(tier))
-
-# ============================================================
-#                   РЕФЕРАЛКА И ВРЕМЕННЫЙ PRO
-# ============================================================
-
-# ----- Memory fallback (если нет Redis/Postgres) -----
-_mem_ref_code: dict[int, str] = {}                 # user_id -> code
-_mem_code_to_uid: dict[str, int] = {}              # code -> user_id
-_mem_ref_bound: dict[int, int] = {}                # friend_id -> referrer_id
-_mem_ref_friends: dict[int, set[int]] = {}         # referrer_id -> {friend_ids}
-_mem_ref_first_rewarded: set[int] = set()          # friend_id, который уже «принёс первую транскрибацию»
-_mem_ref_rewarded_total: dict[int, int] = {}       # referrer_id -> total завершённых «first» наград навсегда (счётчик)
-_mem_ref_rewarded_today: dict[tuple[int, date], int] = {}  # (referrer_id, today) -> count
-_mem_ref_tiers_awarded: dict[int, set[int]] = {}   # user_id -> {порог_интов}
-_mem_temp_pro_until: dict[int, date] = {}          # user_id -> date_until (включительно)
-
-def _gen_ref_code(n: int = 8) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(n))
-
-# ---------- Реф-коды ----------
-
-def get_or_create_ref_code(user_id: int) -> str:
-    # Redis
-    if _redis:
-        try:
-            key = f"ref:code:{user_id}"
-            code = _redis.get(key)
-            if code:
-                return code
-            # генерим уникальный
-            for _ in range(20):
-                code = _gen_ref_code(8)
-                if not _redis.get(f"ref:code_to_uid:{code}"):
-                    break
-            _redis.set(key, code)
-            _redis.set(f"ref:code_to_uid:{code}", user_id)
-            return code
-        except Exception:
-            pass
-
-    # Memory
-    if user_id in _mem_ref_code:
-        return _mem_ref_code[user_id]
-    for _ in range(20):
-        code = _gen_ref_code(8)
-        if code not in _mem_code_to_uid:
-            _mem_code_to_uid[code] = user_id
-            _mem_ref_code[user_id] = code
-            return code
-    # на всякий
-    code = _gen_ref_code(10)
-    _mem_code_to_uid[code] = user_id
-    _mem_ref_code[user_id] = code
-    return code
-
-def resolve_ref_code(code: str) -> Optional[int]:
-    code = (code or "").strip().upper()
-    if not code:
-        return None
-
-    if _redis:
-        try:
-            v = _redis.get(f"ref:code_to_uid:{code}")
-            return int(v) if v is not None else None
-        except Exception:
-            pass
-
-    return _mem_code_to_uid.get(code)
-
-# ---------- Привязка друга к рефереру ----------
-
-def get_referrer(friend_id: int) -> Optional[int]:
-    if _redis:
-        try:
-            v = _redis.get(f"ref:bound:{friend_id}")
-            return int(v) if v is not None else None
-        except Exception:
-            pass
-    return _mem_ref_bound.get(friend_id)
-
-def bind_referral(referrer_id: int, friend_id: int) -> bool:
-    if referrer_id == friend_id:
-        return False
-    if get_referrer(friend_id) is not None:
-        return False
-
-    if _redis:
-        try:
-            pipe = _redis.pipeline()
-            pipe.set(f"ref:bound:{friend_id}", referrer_id)
-            pipe.sadd(f"ref:friends:{referrer_id}", friend_id)
-            pipe.execute()
-            return True
-        except Exception:
-            pass
-
-    _mem_ref_bound[friend_id] = referrer_id
-    _mem_ref_friends.setdefault(referrer_id, set()).add(friend_id)
-    return True
-
-# ---------- Статистика ----------
-
-def get_ref_stats(user_id: int) -> dict:
-    total = 0
-    rewarded_total = 0
-
-    if _redis:
-        try:
-            total = int(_redis.scard(f"ref:friends:{user_id}") or 0)
-        except Exception:
-            total = 0
-        try:
-            rewarded_total = int(_redis.get(f"ref:rewarded_total:{user_id}") or 0)
-        except Exception:
-            rewarded_total = 0
-    else:
-        total = len(_mem_ref_friends.get(user_id, set()))
-        rewarded_total = int(_mem_ref_rewarded_total.get(user_id, 0))
-
-    return {"total": total, "rewarded": rewarded_total}
-
-# ---------- Первая награда другу (first transcription) ----------
-
-def has_first_reward(friend_id: int) -> bool:
-    if _redis:
-        try:
-            return bool(_redis.sismember("ref:first_rewarded", friend_id))
-        except Exception:
-            pass
-    return friend_id in _mem_ref_first_rewarded
-
-def mark_referral_rewarded(friend_id: int) -> None:
-    if has_first_reward(friend_id):
-        return
-    referrer_id = get_referrer(friend_id)
-    if referrer_id is None:
-        # никто не пригласил — но отметим, чтобы дважды не выдать
-        if _redis:
-            try:
-                _redis.sadd("ref:first_rewarded", friend_id)
-            except Exception:
-                pass
-        else:
-            _mem_ref_first_rewarded.add(friend_id)
-        return
-
-    today = date.today()
-
-    if _redis:
-        try:
-            pipe = _redis.pipeline()
-            pipe.sadd("ref:first_rewarded", friend_id)
-            pipe.incr(f"ref:rewarded_total:{referrer_id}")
-            pipe.incr(f"ref:rewarded_today:{referrer_id}:{today.isoformat()}")
-            pipe.execute()
-            return
-        except Exception:
-            pass
-
-    _mem_ref_first_rewarded.add(friend_id)
-    _mem_ref_rewarded_total[referrer_id] = int(_mem_ref_rewarded_total.get(referrer_id, 0)) + 1
-    key = (referrer_id, today)
-    _mem_ref_rewarded_today[key] = int(_mem_ref_rewarded_today.get(key, 0)) + 1
-
-def get_today_rewarded_count(referrer_id: int) -> int:
-    if _redis:
-        try:
-            v = _redis.get(f"ref:rewarded_today:{referrer_id}:{date.today().isoformat()}")
-            return int(v) if v is not None else 0
-        except Exception:
-            return 0
-    return int(_mem_ref_rewarded_today.get((referrer_id, date.today()), 0))
-
-# ---------- Пороги/награды ----------
-
-def is_tier_awarded(user_id: int, need_invites: int) -> bool:
-    need = int(need_invites)
-    if _redis:
-        try:
-            return bool(_redis.sismember(f"ref:tiers_awarded:{user_id}", need))
-        except Exception:
-            pass
-    return need in _mem_ref_tiers_awarded.get(user_id, set())
-
-def mark_tier_awarded(user_id: int, need_invites: int) -> None:
-    need = int(need_invites)
-    if _redis:
-        try:
-            _redis.sadd(f"ref:tiers_awarded:{user_id}", need)
-            return
-        except Exception:
-            pass
-    _mem_ref_tiers_awarded.setdefault(user_id, set()).add(need)
-
-# ---------- Временный PRO ----------
-
-def award_temp_pro_days(user_id: int, days: int) -> None:
-    days = max(0, int(days))
-    if days == 0:
-        return
-    today = date.today()
-    new_until = today + timedelta(days=days)
-
-    if _redis:
-        try:
-            key = f"temp_pro_until:{user_id}"
-            cur = _redis.get(key)
-            if cur:
-                try:
-                    cur_date = date.fromisoformat(cur)
-                    if cur_date > new_until:
-                        new_until = cur_date  # не укорачиваем
-                except Exception:
-                    pass
-            _redis.set(key, new_until.isoformat())
-            _redis.expire(key, 60 * 60 * 24 * 120)  # технический TTL ~4 мес
-            return
-        except Exception:
-            pass
-
-    cur = _mem_temp_pro_until.get(user_id)
-    if cur and cur > new_until:
-        new_until = cur
-    _mem_temp_pro_until[user_id] = new_until
-
-def get_pro_remaining_days(user_id: int) -> int:
-    today = date.today()
-    until: Optional[date] = None
-
-    if _redis:
-        try:
-            v = _redis.get(f"temp_pro_until:{user_id}")
-            if v:
-                until = date.fromisoformat(v)
-        except Exception:
-            until = None
-    else:
-        until = _mem_temp_pro_until.get(user_id)
-
-    if not until:
-        return 0
-    if until < today:
-        return 0
-    # считаем «до и включая until»
-    return (until - today).days
-
