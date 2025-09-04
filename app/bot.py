@@ -241,6 +241,8 @@ async def _reject_if_too_big(update: Update, file_type: str) -> bool:
 # ---------- Команды ----------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     user = update.effective_user
 
     # deep-link: /start ref_<code>
