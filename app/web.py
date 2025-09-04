@@ -1,10 +1,14 @@
 import logging
+from app.config import LOG_LEVEL
 import asyncio
 from flask import Flask, request, jsonify, Response
 from prometheus_client import Counter, Summary, generate_latest, CONTENT_TYPE_LATEST
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+try:
+    logging.basicConfig(level=getattr(logging, str(LOG_LEVEL).upper(), logging.INFO))
+except Exception:
+    logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
