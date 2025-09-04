@@ -31,6 +31,7 @@ DEFAULT_HEADERS = {
 DIRECT_FILE_EXT = (
     ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac",
     ".mp4", ".avi", ".mov", ".wmv", ".flv", ".mkv", ".webm",
+    "Accept": "*/*",
 )
 
 YTDLP_DOMAINS = (
@@ -49,6 +50,8 @@ _CONTENT_TYPE_TO_EXT = {
     "audio/webm": ".webm",
     "video/mp4": ".mp4",
     "video/webm": ".webm",
+    # Максимум редиректов для HTTP-запросов
+    _MAX_REDIRECTS = 5
 }
 
 
@@ -81,7 +84,9 @@ async def _download_direct_stream(
     out_path = os.path.join(dest_dir, fname + ".bin")
 
     chunk_size = max(1, int(STREAM_CHUNK_MB * 1024 * 1024))
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=STREAM_TIMEOUT_S)
+    # общий «стоп-кран» = ~4× таймаут чтения сокета
+    timeout = aiohttp.ClientTimeout(total=max(5, int(STREAM_TIMEOUT_S) * 4),
+                                    sock_read=int(STREAM_TIMEOUT_S))
     total = 0
 
     # Пул коннектов ограничим немного, чтобы не «забить» контейнер
@@ -89,7 +94,8 @@ async def _download_direct_stream(
     async with aiohttp.ClientSession(timeout=timeout, headers=headers or DEFAULT_HEADERS, connector=connector) as session:
         # HEAD — попробуем заранее понять размер (не все сервера поддерживают)
         try:
-            async with session.head(url, allow_redirects=True) as hresp:
+            async with session.head(url, allow_redirects=True, max_redirects=_MAX_REDIRECTS) as hresp:
+                 if hresp.status // 100 == 2:
                 if hresp.status // 100 == 2:
                     cl = hresp.headers.get("Content-Length")
                     if cl and cl.isdigit():
@@ -99,7 +105,12 @@ async def _download_direct_stream(
         except Exception:
             pass
 
-        async with session.get(url) as resp:
+        try:
+            resp_ctx = session.get(url, allow_redirects=True, max_redirects=_MAX_REDIRECTS)
+        except Exception as e:
+            return {"success": False, "error": f"HTTP init error: {e}"}
+
+        async with resp_ctx as resp:
             if resp.status != 200:
                 return {"success": False, "error": f"HTTP {resp.status}"}
 
@@ -162,10 +173,15 @@ async def _download_with_ytdlp(
         "no_warnings": True,
         "retries": 3,
         "http_headers": DEFAULT_HEADERS,
+         жёсткий таймаут сокета для нестабильных источников
+        "socket_timeout": int(STREAM_TIMEOUT_S) or 30,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        return {"success": False, "error": f"yt-dlp error: {e}"}
         out_path = ydl.prepare_filename(info)
         if not os.path.exists(out_path):
             # Попробуем подобрать итоговый файл, если расширение изменилось
@@ -221,6 +237,10 @@ async def download_from_url(url: str, dest_dir: str, max_size_mb: float) -> Dict
             return res
         # 2) фолбэк в yt-dlp
         return await _download_with_ytdlp(url, dest_dir, max_size_mb)
+    except aiohttp.TooManyRedirects:
+        return {"success": False, "error": f"Слишком много редиректов (>{_MAX_REDIRECTS})"}
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Таймаут загрузки"}
     except Exception as e:
         logger.exception("download_from_url error")
         return {"success": False, "error": str(e)}
