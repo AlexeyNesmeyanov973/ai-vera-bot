@@ -88,13 +88,15 @@ DIARIZATION_BACKEND = os.getenv("DIARIZATION_BACKEND", "none")  # "pyannote" | "
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 
 # === Реферальная программа: базовые настройки ===
-REF_ENABLED = int(os.getenv("REF_ENABLED", "1"))  # 1=вкл, 0=выкл
+REF_ENABLED = os.getenv("REF_ENABLED", "0") in ("1", "true", "True", "yes", "YES")  # 1=вкл, 0=выкл
 REF_BONUS_MINUTES = int(os.getenv("REF_BONUS_MINUTES", "10"))  # за первую удачную транскрибацию друга
-REF_MAX_REWARDS_PER_REFERRER_PER_DAY = int(os.getenv("REF_MAX_REWARDS_PER_REFERRER_PER_DAY", "5"))
+REF_MAX_REWARDS_PER_REFERRER_PER_DAY = int(os.getenv("REF_MAX_REWARDS_PER_REFERRER_PER_DAY", "3"))
+REF_TIERS = os.getenv("REF_TIERS", "3:1,5:3,10:7")  # строка, парсишь в боте
 
 # === Реферальные «трофеи» (ВАУ): пороги → дни PRO ===
 # Формат: "3:1,5:3,10:7"  (за 3 друзей — 1 день PRO; за 5 — 3 дня; за 10 — 7 дней)
 REF_TIERS = os.getenv("REF_TIERS", "3:1,5:3,10:7")
+
 
 # Необязательно: сттикеры для уведомлений о достижении порогов (по порядку)
 # Пример: REF_TIER_STICKERS="CAACAgIAAxkBA...,CAACAgIAAxkBB..."
