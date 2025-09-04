@@ -132,16 +132,18 @@ class TaskManager:
         os.makedirs(d, exist_ok=True)
         return d
 
-    def _chunk_media(self, src_path: str, max_minutes: int = 30) -> List[str]:
-        """Разбиваем медиа на куски по max_minutes при наличии ffmpeg."""
+    def _chunk_media(self, src_path: str, max_minutes: int = 30) -> tuple[List[str], Optional[str]]:
+         """Разбиваем медиа на куски по max_minutes при наличии ffmpeg.
+         Возвращает: (список_файлов, путь_к_временной_директории_или_None)
+         """
         try:
             completed = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
             if completed.returncode != 0:
                 logger.warning("ffmpeg не найден — чанкование пропущено")
-                return [src_path]
+                return [src_path], None
         except Exception:
             logger.warning("ffmpeg не найден — чанкование пропущено (исключение)")
-            return [src_path]
+            return [src_path], None
 
         out_dir = os.path.join(self._safe_tmpdir(), f"chunks_{uuid.uuid4().hex[:8]}")
         os.makedirs(out_dir, exist_ok=True)
@@ -162,7 +164,7 @@ class TaskManager:
         rc = subprocess.call(cmd)
         chunked = sorted([os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("part_")])
         if rc == 0 and chunked:
-            return chunked
+            return chunked, out_dir
 
         # Fallback: в WAV с разбиением
         out_tpl = os.path.join(out_dir, "part_%03d.wav")
@@ -176,11 +178,11 @@ class TaskManager:
         rc = subprocess.call(cmd)
         chunked = sorted([os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("part_")])
         if rc == 0 and chunked:
-            return chunked
+            return chunked, out_dir
 
         logger.warning("Не удалось разрезать файл — используем оригинал.")
         shutil.rmtree(out_dir, ignore_errors=True)
-        return [src_path]
+        return [src_path], None
 
     def _merge_texts(self, parts: List[Dict]) -> Tuple[str, List[Dict], float, Optional[str], int]:
         """
@@ -257,18 +259,18 @@ class TaskManager:
             return {"success": False, "error": "limit_exceeded", "message": error_message or "Лимит исчерпан"}
 
         # 3) Чанки
+        chunk_dir = None
         try:
-            chunks = self._chunk_media(local_path, max_minutes=30)
-        except Exception:
+            chunks, chunk_dir = self._chunk_media(local_path, max_minutes=30)
+         except Exception:
             logger.exception("Ошибка чанкования — продолжу одним файлом")
-            chunks = [local_path]
+            chunks, chunk_dir = [local_path], None
 
         # 4) Транскрибация
         self._ensure_audio()
         per_parts: List[Dict] = []
         language = None if WHISPER_LANGUAGE == "auto" else WHISPER_LANGUAGE
 
-        started = time.perf_counter()
         try:
             for idx, cpath in enumerate(chunks, start=1):
                 logger.info("Транскрибация %s/%s: %s", idx, len(chunks), cpath)
@@ -277,6 +279,19 @@ class TaskManager:
         except Exception as e:
             logger.exception("Ошибка транскрибации")
             return {"success": False, "error": "transcribe_failed", "message": str(e)}
+        finally:
+            # Чистка временных артефактов (чанки и исходник)
+            try:
+                if chunk_dir and os.path.isdir(chunk_dir):
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+            except Exception:
+                logger.warning("Не удалось удалить директорию чанков: %s", chunk_dir)
+            try:
+                if local_path and os.path.exists(local_path):
+                    # исходник больше не нужен (PDF/результаты уже построены позже)
+                    pass  # удалим после построения PDF ниже
+            except Exception:
+                pass
         processing_time_s = time.perf_counter() - started
 
         # 5) Склейка
@@ -309,7 +324,7 @@ class TaskManager:
             pdf_path = None
 
         # 8) Итог
-        return {
+        return = {
             "success": True,
             "text": full_text,
             "segments": all_segments,
@@ -321,5 +336,12 @@ class TaskManager:
             "processing_time_s": float(processing_time_s),
         }
 
+        # Чистим исходник после того, как все данные уже собраны
+        try:
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            logger.debug("Не удалось удалить исходный файл: %s", local_path)
+        return result
 
 task_manager = TaskManager()
