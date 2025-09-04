@@ -41,50 +41,61 @@ def _env_list_int(key: str) -> list[int]:
     return out
 
 # === Telegram ===
-TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN")
-ADMIN_USER_IDS = _env_list_int("ADMIN_USER_IDS")
-PRO_USER_IDS = _env_list_int("PRO_USER_IDS")  # миграция на старте
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
 
 # === Prodamus (fallback) ===
-PRODAMUS_WEBHOOK_SECRET = _env_str("PRODAMUS_WEBHOOK_SECRET")
-PRODAMUS_PAYMENT_LINK   = _env_str("PRODAMUS_PAYMENT_LINK")
-PRODAMUS_PRO_AMOUNT     = _env_float("PRODAMUS_PRO_AMOUNT", 299.0)
+PRODAMUS_WEBHOOK_SECRET = os.getenv("PRODAMUS_WEBHOOK_SECRET", "")
+PRODAMUS_PAYMENT_LINK = os.getenv("PRODAMUS_PAYMENT_LINK", "")
+PRODAMUS_PRO_AMOUNT = float(os.getenv("PRODAMUS_PRO_AMOUNT", "299.0"))
 
 # === YooKassa (приоритетная, если задана) ===
-YOOKASSA_SHOP_ID     = _env_str("YOOKASSA_SHOP_ID")
-YOOKASSA_SECRET_KEY  = _env_str("YOOKASSA_SECRET_KEY")
-YOOKASSA_RETURN_URL  = _env_str("YOOKASSA_RETURN_URL")
-YOOKASSA_PRO_AMOUNT  = _env_float("YOOKASSA_PRO_AMOUNT", 299.0)
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "")
+YOOKASSA_PRO_AMOUNT = float(os.getenv("YOOKASSA_PRO_AMOUNT", "299.0"))
 
 # === Whisper ===
-WHISPER_BACKEND   = _env_str("WHISPER_BACKEND", "faster")  # "faster" | "openai"
-WHISPER_MODEL     = _env_str("WHISPER_MODEL", "small")
-WHISPER_LANGUAGE  = _env_str("WHISPER_LANGUAGE", "auto")   # "auto" по умолчанию
+WHISPER_BACKEND = os.getenv("WHISPER_BACKEND", "faster")   # "faster" или "openai"
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru")     # "ru" или "auto"
 
 # === Лимиты ===
-FREE_USER_DAILY_LIMIT_MINUTES = _env_int("FREE_USER_DAILY_LIMIT_MINUTES", 30)
-PRO_USER_DAILY_LIMIT_MINUTES  = _env_int("PRO_USER_DAILY_LIMIT_MINUTES", 180)
-MAX_FILE_SIZE_MB              = _env_int("MAX_FILE_SIZE_MB", 49)       # TG файлы
-URL_MAX_FILE_SIZE_MB          = _env_int("URL_MAX_FILE_SIZE_MB", 1024) # по ссылкам
+FREE_USER_DAILY_LIMIT_MINUTES = int(os.getenv("FREE_USER_DAILY_LIMIT_MINUTES", "30"))
+PRO_USER_DAILY_LIMIT_MINUTES = int(os.getenv("PRO_USER_DAILY_LIMIT_MINUTES", "180"))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "20"))            # для файлов из Telegram
+URL_MAX_FILE_SIZE_MB = int(os.getenv("URL_MAX_FILE_SIZE_MB", "2000"))  # по ссылке
 
 # === Сверх лимита (докупка) ===
-OVERAGE_PRICE_RUB = _env_float("OVERAGE_PRICE_RUB", 5.0)
+OVERAGE_PRICE_RUB = float(os.getenv("OVERAGE_PRICE_RUB", "2.0"))
+
+# === PRO пользователи (миграция при старте) ===
+PRO_USER_IDS = [int(x) for x in os.getenv("PRO_USER_IDS", "").split(",") if x.strip()]
 
 # === Опциональные сервисы ===
-REDIS_URL    = _env_str("REDIS_URL")
-DATABASE_URL = _env_str("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# === Временные файлы / потоковая загрузка ===
-TMP_DIR            = _env_str("TMP_DIR", "downloads")
-STREAM_CHUNK_MB    = _env_float("STREAM_CHUNK_MB", 4.0)
-STREAM_TIMEOUT_S   = _env_int("STREAM_TIMEOUT_S", 45)
-RESUME_DOWNLOADS   = _env_bool("RESUME_DOWNLOADS", True)
-YTDLP_AUDIO_ONLY   = _env_bool("YTDLP_AUDIO_ONLY", True)
+# === Потоковая загрузка / временные файлы ===
+TMP_DIR = os.getenv("TMP_DIR", "downloads")
+STREAM_CHUNK_MB = float(os.getenv("STREAM_CHUNK_MB", "4"))
+STREAM_TIMEOUT_S = int(os.getenv("STREAM_TIMEOUT_S", "45"))
+RESUME_DOWNLOADS = int(os.getenv("RESUME_DOWNLOADS", "1"))
+YTDLP_AUDIO_ONLY = int(os.getenv("YTDLP_AUDIO_ONLY", "1"))
 
 # === Диаризация (опционально) ===
-DIARIZATION_BACKEND = _env_str("DIARIZATION_BACKEND", "none")  # "pyannote" | "none"
-HUGGINGFACE_TOKEN   = _env_str("HUGGINGFACE_TOKEN")
+DIARIZATION_BACKEND = os.getenv("DIARIZATION_BACKEND", "none")  # "pyannote" | "none"
+HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
 
-# Удобные флаги наличия внешних сервисов
-HAVE_REDIS = bool(REDIS_URL.strip())
-HAVE_PG    = bool(DATABASE_URL.strip())
+# === Реферальная программа: базовые настройки ===
+REF_ENABLED = int(os.getenv("REF_ENABLED", "1"))  # 1=вкл, 0=выкл
+REF_BONUS_MINUTES = int(os.getenv("REF_BONUS_MINUTES", "10"))  # за первую удачную транскрибацию друга
+REF_MAX_REWARDS_PER_REFERRER_PER_DAY = int(os.getenv("REF_MAX_REWARDS_PER_REFERRER_PER_DAY", "5"))
+
+# === Реферальные «трофеи» (ВАУ): пороги → дни PRO ===
+# Формат: "3:1,5:3,10:7"  (за 3 друзей — 1 день PRO; за 5 — 3 дня; за 10 — 7 дней)
+REF_TIERS = os.getenv("REF_TIERS", "3:1,5:3,10:7")
+
+# Необязательно: сттикеры для уведомлений о достижении порогов (по порядку)
+# Пример: REF_TIER_STICKERS="CAACAgIAAxkBA...,CAACAgIAAxkBB..."
+REF_TIER_STICKERS = [s for s in os.getenv("REF_TIER_STICKERS", "").split(",") if s.strip()]
