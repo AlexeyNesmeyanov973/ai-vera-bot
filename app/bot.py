@@ -158,7 +158,21 @@ def _parse_ref_tiers(s: str) -> list[tuple[int, int]]:
     out.sort(key=lambda x: x[0])
     return out
 
+def _parse_sticker_map(s: str) -> dict[int, str]:
+    out = {}
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        a, b = part.split(":", 1)
+        try:
+            out[int(a)] = b.strip()
+        except Exception:
+            pass
+    return out
+    
 _REF_TIERS = _parse_ref_tiers(REF_TIERS)
+_STICKERS_BY_TIER = _parse_sticker_map(REF_TIER_STICKERS)
 
 async def _maybe_award_ref_tier(referrer_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     """Выдать временный PRO за достижение порога приглашенных друзей."""
